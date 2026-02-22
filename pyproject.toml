@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "voxtray"
+version = "0.1.0"
+description = "Local Voxtral realtime transcription utility for Ubuntu/GNOME"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [{ name = "Victor" }]
+dependencies = [
+  "httpx>=0.27",
+  "numpy>=1.26",
+  "platformdirs>=4.2",
+  "sounddevice>=0.4.7",
+  "tomli-w>=1.0",
+  "typer>=0.12",
+  "websockets>=12,<16",
+]
+
+[project.optional-dependencies]
+ui = ["PySide6>=6.7"]
+audiofile = ["librosa>=0.10"]
+dev = ["pytest>=8.2"]
+
+[project.scripts]
+voxtray = "voxtray.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/voxtray"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

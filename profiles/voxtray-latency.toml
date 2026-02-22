@@ -1,0 +1,45 @@
+model_id = "mistralai/Voxtral-Mini-4B-Realtime-2602"
+
+[server]
+host = "127.0.0.1"
+port = 8000
+start_timeout_seconds = 900
+external_base_url = ""
+
+[audio]
+device = "default"
+sample_rate = 16000
+chunk_ms = 40
+
+[history]
+max_items = 5
+
+[clipboard]
+backend = "auto"
+
+[postprocess]
+clean_text = true
+
+[realtime]
+final_timeout_seconds = 8.0
+segment_max_seconds = 90
+segment_finalize_timeout_seconds = 6.0
+mic_queue_chunks = 4096
+stop_tail_ms = 240
+first_chunk_grace_ms = 220
+
+[engine]
+command = "vllm"
+enforce_eager = true
+disable_compile_cache = true
+compilation_config = "{\"cudagraph_mode\":\"PIECEWISE\"}"
+extra_args = [
+  "--gpu-memory-utilization",
+  "0.68",
+  "--max-model-len",
+  "1536",
+  "--max-num-batched-tokens",
+  "512",
+  "--max-num-seqs",
+  "1",
+]
