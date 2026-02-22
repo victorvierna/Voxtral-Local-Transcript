@@ -44,7 +44,9 @@ Instalar `vLLM` (GPU NVIDIA):
 pip install -U vllm --extra-index-url https://download.pytorch.org/whl/cu129
 ```
 
-Si el modelo en Hugging Face requiere acceso autenticado:
+Acceso a Hugging Face (opcional):
+- Para modelos públicos, normalmente no hace falta token.
+- Solo necesitas token si el modelo está restringido/gated o es privado.
 
 ```bash
 export HF_TOKEN=...
@@ -144,10 +146,39 @@ Generar bundle para compartir:
 scripts/build_wsl2_bundle.sh
 ```
 
-Instalación en Windows (PowerShell), dentro de la carpeta extraída:
+Instalación inicial en Windows (PowerShell), dentro de la carpeta extraída:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\install_windows_shortcuts.ps1 -Distro Ubuntu
+```
+
+Qué hace este instalador:
+- Instala dependencias en WSL2 (Ubuntu).
+- Crea el entorno Python y Voxtray en `~/.voxtray`.
+- Genera accesos directos de Windows para usar Voxtray sin abrir terminal Linux.
+
+Activación y uso diario en Windows:
+1. Usa el acceso directo `Voxtray Toggle` (escritorio o menú inicio) para iniciar/parar grabación.
+2. Usa `Voxtray Warm On/Off` para mantener o liberar el motor en memoria.
+3. Usa `Voxtray Status` para revisar estado rápido.
+4. Usa `Voxtray Logs` si quieres diagnóstico.
+
+Atajo global en Windows (opcional):
+1. Haz clic derecho sobre `Voxtray Toggle` y abre `Propiedades`.
+2. En la pestaña `Acceso directo`, coloca el cursor en `Tecla de método abreviado`.
+3. Pulsa la combinación deseada (recomendado: `Ctrl + Alt + F9`).
+4. Pulsa `Aplicar` y `Aceptar`.
+
+Notas:
+- El acceso directo también está en `%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Voxtray WSL`.
+- Si eliges una tecla simple, Windows suele convertirla a `Ctrl + Alt + <tecla>`.
+- Evita combinaciones ya usadas por otras apps o por el sistema.
+
+Verificación rápida desde PowerShell:
+
+```powershell
+wsl -d Ubuntu -- bash -lc "~/.voxtray/.venv/bin/voxtray status"
+wsl -d Ubuntu -- bash -lc "~/.voxtray/.venv/bin/voxtray warm on"
 ```
 
 ## Desarrollo
