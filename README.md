@@ -1,20 +1,22 @@
 # Voxtray
 
-Voxtray es una utilidad local de transcripción en tiempo real (CLI + bandeja del sistema) construida alrededor de `mistralai/Voxtral-Mini-4B-Realtime-2602`.
+Voxtray is a local real-time transcription utility (CLI + system tray) built around `mistralai/Voxtral-Mini-4B-Realtime-2602`.
 
-Está pensada para uso diario en Ubuntu/WSL2 con activación rápida (`toggle`), copiado automático al portapapeles e historial reciente.
+It is designed for daily Ubuntu/WSL2 usage with quick toggle activation, automatic clipboard copy, and recent-history tracking.
 
-## Características
+Spanish documentation: `LEEME.md`.
 
-- Grabación por `start/stop/toggle` desde terminal.
-- Atajo global en GNOME (`Super+F9` por defecto).
-- Copia automática del texto final al portapapeles.
-- Historial persistente (últimas 5 transcripciones por defecto).
-- Modo bandeja (`tray`) con acciones rápidas y estado del motor.
-- Transcripción de archivos de audio (`transcribe-file`).
-- Flujo de distribución para Windows + WSL2 (scripts incluidos).
+## Features
 
-## Requisitos
+- `start/stop/toggle` recording from terminal.
+- Global GNOME shortcut (`Super+F9` by default).
+- Automatic copy of final transcript to clipboard.
+- Persistent history (last 5 transcripts by default).
+- Tray mode (`tray`) with quick actions and engine status.
+- Audio file transcription (`transcribe-file`).
+- Windows + WSL2 distribution flow (included scripts).
+
+## Requirements
 
 ### Ubuntu 24.04 / WSL2
 
@@ -32,51 +34,51 @@ pip install -U pip
 pip install -e '.[dev]'
 ```
 
-Si quieres modo bandeja Qt:
+If you want Qt tray mode:
 
 ```bash
 pip install -e '.[ui]'
 ```
 
-Instalar `vLLM` (GPU NVIDIA):
+Install `vLLM` (NVIDIA GPU):
 
 ```bash
 pip install -U vllm --extra-index-url https://download.pytorch.org/whl/cu129
 ```
 
-Acceso a Hugging Face (opcional):
-- Para modelos públicos, normalmente no hace falta token.
-- Solo necesitas token si el modelo está restringido/gated o es privado.
+Hugging Face access (optional):
+- For public models, a token is usually not required.
+- You only need a token if the model is gated/restricted or private.
 
 ```bash
 export HF_TOKEN=...
 ```
 
-## Inicio rápido
+## Quick Start
 
-Inicializar configuración:
+Initialize config:
 
 ```bash
 voxtray init
 ```
 
-Ver estado y logs:
+Check status and logs:
 
 ```bash
 voxtray status
 voxtray logs --target all --lines 200
 ```
 
-Grabar desde terminal:
+Record from terminal:
 
 ```bash
 voxtray record --start
 voxtray record --stop
-# recomendado para atajo global
+# recommended for global shortcut usage
 voxtray record --toggle
 ```
 
-Control de motor/modelo:
+Engine/model controls:
 
 ```bash
 voxtray warm on
@@ -87,52 +89,52 @@ voxtray model unload
 voxtray model status
 ```
 
-Historial:
+History:
 
 ```bash
 voxtray history list
 voxtray history copy 1
 ```
 
-Transcribir archivo de audio:
+Transcribe audio file:
 
 ```bash
-voxtray transcribe-file /ruta/audio.m4a --copy
+voxtray transcribe-file /path/audio.m4a --copy
 ```
 
-## Configuración y perfiles
+## Configuration and Profiles
 
-Archivo principal:
+Main file:
 
 - `~/.config/voxtray/config.toml`
 
-Perfiles de memoria incluidos:
+Included memory profiles:
 
 - `profiles/voxtray-balanced.toml`
 - `profiles/voxtray-vram-saver.toml`
 - `profiles/voxtray-latency.toml`
 
-Aplicar perfil:
+Apply profile:
 
 ```bash
 scripts/apply_profile.sh balanced
 ```
 
-Valores disponibles:
+Available values:
 
 - `balanced`
 - `vram-saver`
 - `latency`
 
-## Integración GNOME
+## GNOME Integration
 
-Instala desktop entry + autostart + shortcut por defecto (`Super+F9`):
+Install desktop entry + autostart + default shortcut (`Super+F9`):
 
 ```bash
 scripts/install_ubuntu_integration.sh
 ```
 
-Solo instalar shortcut:
+Install only shortcut:
 
 ```bash
 voxtray install-shortcut --binding '<Super>F9'
@@ -140,70 +142,70 @@ voxtray install-shortcut --binding '<Super>F9'
 
 ## Windows + WSL2
 
-Generar bundle para compartir:
+Build bundle to share:
 
 ```bash
 scripts/build_wsl2_bundle.sh
 ```
 
-Instalación inicial en Windows (PowerShell), dentro de la carpeta extraída:
+Initial install on Windows (PowerShell), inside the extracted folder:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\install_windows_shortcuts.ps1 -Distro Ubuntu
 ```
 
-Qué hace este instalador:
-- Instala dependencias en WSL2 (Ubuntu).
-- Crea el entorno Python y Voxtray en `~/.voxtray`.
-- Genera accesos directos de Windows para usar Voxtray sin abrir terminal Linux.
+What this installer does:
+- Installs dependencies inside WSL2 (Ubuntu).
+- Creates the Python environment and Voxtray in `~/.voxtray`.
+- Generates Windows shortcuts to run Voxtray without opening a Linux terminal.
 
-Activación y uso diario en Windows:
-1. Usa el acceso directo `Voxtray Toggle` (escritorio o menú inicio) para iniciar/parar grabación.
-2. Usa `Voxtray Warm On/Off` para mantener o liberar el motor en memoria.
-3. Usa `Voxtray Status` para revisar estado rápido.
-4. Usa `Voxtray Logs` si quieres diagnóstico.
+Daily activation and usage on Windows:
+1. Use `Voxtray Toggle` shortcut (desktop or start menu) to start/stop recording.
+2. Use `Voxtray Warm On/Off` to keep or release the engine in memory.
+3. Use `Voxtray Status` for quick status checks.
+4. Use `Voxtray Logs` for diagnostics.
 
-Atajo global en Windows (opcional):
-1. Haz clic derecho sobre `Voxtray Toggle` y abre `Propiedades`.
-2. En la pestaña `Acceso directo`, coloca el cursor en `Tecla de método abreviado`.
-3. Pulsa la combinación deseada (recomendado: `Ctrl + Alt + F9`).
-4. Pulsa `Aplicar` y `Aceptar`.
+Global shortcut on Windows (optional):
+1. Right-click `Voxtray Toggle` and open `Properties`.
+2. In the `Shortcut` tab, focus `Shortcut key`.
+3. Press your desired key combination (recommended: `Ctrl + Alt + F9`).
+4. Click `Apply` and `OK`.
 
-Notas:
-- El acceso directo también está en `%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Voxtray WSL`.
-- Si eliges una tecla simple, Windows suele convertirla a `Ctrl + Alt + <tecla>`.
-- Evita combinaciones ya usadas por otras apps o por el sistema.
+Notes:
+- The shortcut also exists in `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Voxtray WSL`.
+- If you choose a simple key, Windows typically converts it to `Ctrl + Alt + <key>`.
+- Avoid combinations already used by other apps or the OS.
 
-Verificación rápida desde PowerShell:
+Quick check from PowerShell:
 
 ```powershell
 wsl -d Ubuntu -- bash -lc "~/.voxtray/.venv/bin/voxtray status"
 wsl -d Ubuntu -- bash -lc "~/.voxtray/.venv/bin/voxtray warm on"
 ```
 
-## Desarrollo
+## Development
 
-Ejecutar tests:
+Run tests:
 
 ```bash
 pytest
 ```
 
-Estructura del proyecto:
+Project structure:
 
-- `src/voxtray/`: implementación principal (CLI, control, realtime, tray).
-- `tests/`: pruebas unitarias.
-- `scripts/`: integración Ubuntu/WSL2 y utilidades de empaquetado.
-- `profiles/`: plantillas de configuración de rendimiento/memoria.
+- `src/voxtray/`: main implementation (CLI, controller, realtime, tray).
+- `tests/`: unit tests.
+- `scripts/`: Ubuntu/WSL2 integration and packaging utilities.
+- `profiles/`: performance/memory configuration templates.
 
-## Seguridad y datos locales
+## Security and Local Data
 
-- No subas credenciales ni tokens al repositorio.
-- Usa variables de entorno locales (ejemplo en `.env.example`).
-- Estado, logs e historial se guardan en tu home:
+- Do not commit credentials or tokens.
+- Use local environment variables (example in `.env.example`).
+- State, logs, and history are stored in your home directory:
   - `~/.local/state/voxtray/`
   - `~/.local/share/voxtray/`
 
-## Licencia
+## License
 
-Apache-2.0. Ver `LICENSE`.
+Apache-2.0. See `LICENSE`.
