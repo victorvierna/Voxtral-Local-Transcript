@@ -64,9 +64,25 @@ class EngineManager:
         state = self.state_store.read()
         pid = state.get("engine_pid")
         if pid and pid_is_alive(pid):
-            # Process exists but not ready yet: wait a bit before trying restart.
-            self._wait_until_ready_or_fail(pid)
-            return
+            if not self._is_expected_engine_pid(pid):
+                self.logger.warning(
+                    "state engine_pid=%s is alive but does not look like vLLM; resetting",
+                    pid,
+                )
+                self.state_store.set_values(engine_pid=None)
+            else:
+                # Process exists but is not ready. Wait first, then force a clean restart.
+                try:
+                    self._wait_until_ready_or_fail(pid)
+                    return
+                except EngineError as exc:
+                    self.logger.warning(
+                        "existing vLLM process %s failed readiness check (%s); restarting",
+                        pid,
+                        exc,
+                    )
+                    self._stop_process_group(pid, timeout_seconds=5.0)
+                    self.state_store.set_values(engine_pid=None)
 
         self.start_local_engine()
 
@@ -113,9 +129,38 @@ class EngineManager:
             if self.is_ready(timeout_seconds=2.0):
                 return
             time.sleep(1.0)
+        self.state_store.set_values(engine_pid=None)
         raise EngineError(
             f"vLLM not ready after {timeout}s. See log: {VLLM_LOG_FILE}"
         )
+
+    @staticmethod
+    def _read_process_cmdline(pid: int) -> list[str] | None:
+        cmdline_path = Path(f"/proc/{pid}/cmdline")
+        try:
+            raw = cmdline_path.read_bytes()
+        except OSError:
+            return None
+        if not raw:
+            return []
+        return [part.decode("utf-8", errors="replace") for part in raw.split(b"\0") if part]
+
+    def _is_expected_engine_pid(self, pid: int) -> bool:
+        cmdline = self._read_process_cmdline(pid)
+        if cmdline is None:
+            # If we cannot inspect /proc, preserve legacy behavior.
+            return True
+        if not cmdline:
+            return False
+        parts = [part.strip() for part in cmdline if part.strip()]
+        if not parts:
+            return False
+
+        expected = Path(self.config.engine.command).name
+        names = {Path(part).name for part in parts}
+        if expected == "vllm":
+            return "vllm" in names and "serve" in parts
+        return expected in names
 
     @staticmethod
     def _process_group_is_alive(pgid: int) -> bool:
@@ -145,6 +190,19 @@ class EngineManager:
                 return False
         return False
 
+    def _stop_process_group(self, pgid: int, timeout_seconds: float) -> None:
+        if not pid_is_alive(pgid):
+            return
+        self.logger.info("stopping vLLM process group pgid=%s", pgid)
+        if not self._signal_process_group(pgid, signal.SIGTERM):
+            return
+        deadline = time.time() + timeout_seconds
+        while time.time() < deadline:
+            if not self._process_group_is_alive(pgid):
+                return
+            time.sleep(0.2)
+        self._signal_process_group(pgid, signal.SIGKILL)
+
     def stop_if_running(self, timeout_seconds: float = 15.0) -> None:
         state = self.state_store.read()
         pid = state.get("engine_pid")
@@ -154,15 +212,5 @@ class EngineManager:
             self.state_store.set_values(engine_pid=None)
             return
 
-        self.logger.info("stopping vLLM process group pgid=%s", pid)
-        if not self._signal_process_group(pid, signal.SIGTERM):
-            self.state_store.set_values(engine_pid=None)
-            return
-        deadline = time.time() + timeout_seconds
-        while time.time() < deadline:
-            if not self._process_group_is_alive(pid):
-                self.state_store.set_values(engine_pid=None)
-                return
-            time.sleep(0.2)
-        self._signal_process_group(pid, signal.SIGKILL)
+        self._stop_process_group(pid, timeout_seconds=timeout_seconds)
         self.state_store.set_values(engine_pid=None)

@@ -12,6 +12,9 @@ import tomli_w
 from .paths import CONFIG_FILE, ensure_app_dirs
 
 
+VOXTRAL_MODEL_PREFIX = "mistralai/voxtral-"
+
+
 @dataclass(slots=True)
 class ServerConfig:
     host: str = "127.0.0.1"
@@ -135,9 +138,24 @@ def _default_dict() -> dict[str, Any]:
             "enforce_eager": False,
             "disable_compile_cache": True,
             "compilation_config": '{"cudagraph_mode":"PIECEWISE"}',
-            "extra_args": [],
+            "extra_args": ["--trust-remote-code"],
         },
     }
+
+
+def _normalize_engine_extra_args(model_id: str, engine_data: dict[str, Any]) -> dict[str, Any]:
+    raw_args = engine_data.get("extra_args", [])
+    if isinstance(raw_args, list):
+        extra_args = [str(arg) for arg in raw_args]
+    else:
+        extra_args = [str(raw_args)] if raw_args else []
+
+    if model_id.lower().startswith(VOXTRAL_MODEL_PREFIX):
+        if "--trust-remote-code" not in extra_args:
+            extra_args = ["--trust-remote-code", *extra_args]
+
+    engine_data["extra_args"] = extra_args
+    return engine_data
 
 
 def config_to_dict(config: VoxtrayConfig) -> dict[str, Any]:
@@ -202,13 +220,14 @@ def load_config(path: Path | None = None) -> VoxtrayConfig:
     clipboard = ClipboardConfig(**data["clipboard"])
     postprocess = PostprocessConfig(**data["postprocess"])
     realtime = RealtimeConfig(**data["realtime"])
-    engine_data = dict(data["engine"])
+    model_id = str(data["model_id"])
+    engine_data = _normalize_engine_extra_args(model_id, dict(data["engine"]))
     engine_data["command"] = _resolve_engine_command(
         str(engine_data.get("command", "vllm"))
     )
     engine = EngineConfig(**engine_data)
     return VoxtrayConfig(
-        model_id=data["model_id"],
+        model_id=model_id,
         server=server,
         audio=audio,
         history=history,

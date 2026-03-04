@@ -47,6 +47,7 @@ extra_args = []
     assert config.realtime.mic_queue_chunks == 4096
     assert config.realtime.stop_tail_ms == 240
     assert config.realtime.first_chunk_grace_ms == 220
+    assert config.engine.extra_args == ["--trust-remote-code"]
 
 
 def test_load_config_accepts_realtime_overrides(tmp_path: Path):
@@ -72,3 +73,21 @@ first_chunk_grace_ms = 180
     assert config.realtime.mic_queue_chunks == 2048
     assert config.realtime.stop_tail_ms == 320
     assert config.realtime.first_chunk_grace_ms == 180
+    assert config.engine.extra_args == ["--trust-remote-code"]
+
+
+def test_load_config_does_not_force_trust_remote_code_for_non_voxtral_model(tmp_path: Path):
+    cfg_path = tmp_path / "custom-model.toml"
+    cfg_path.write_text(
+        """
+model_id = "openai/whisper-large-v3"
+
+[engine]
+extra_args = []
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_config(cfg_path)
+
+    assert config.engine.extra_args == []
