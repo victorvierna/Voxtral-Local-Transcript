@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 from types import SimpleNamespace
 
@@ -58,3 +59,48 @@ def test_start_generation_uses_non_final_commit() -> None:
     asyncio.run(transcriber._start_generation(ws))
 
     assert ws.sent == [json.dumps({"type": "input_audio_buffer.commit", "final": False})]
+
+
+def test_append_chunk_starts_generation_after_first_audio() -> None:
+    transcriber = _make_transcriber()
+    ws = FakeWebSocket({"type": "session.created"})
+
+    asyncio.run(
+        transcriber._append_chunk_and_maybe_start_generation(
+            ws,
+            b"\x01\x00\x02\x00",
+            generation_started=False,
+        )
+    )
+
+    assert ws.sent == [
+        json.dumps(
+            {
+                "type": "input_audio_buffer.append",
+                "audio": base64.b64encode(b"\x01\x00\x02\x00").decode("utf-8"),
+            }
+        ),
+        json.dumps({"type": "input_audio_buffer.commit", "final": False}),
+    ]
+
+
+def test_append_chunk_does_not_restart_generation_once_running() -> None:
+    transcriber = _make_transcriber()
+    ws = FakeWebSocket({"type": "session.created"})
+
+    asyncio.run(
+        transcriber._append_chunk_and_maybe_start_generation(
+            ws,
+            b"\x03\x00\x04\x00",
+            generation_started=True,
+        )
+    )
+
+    assert ws.sent == [
+        json.dumps(
+            {
+                "type": "input_audio_buffer.append",
+                "audio": base64.b64encode(b"\x03\x00\x04\x00").decode("utf-8"),
+            }
+        )
+    ]

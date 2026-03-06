@@ -98,6 +98,20 @@ class RealtimeTranscriber:
         for chunk in chunks:
             await self._append_audio_chunk(ws, chunk)
 
+    async def _append_chunk_and_maybe_start_generation(
+        self,
+        ws,
+        chunk: bytes,
+        generation_started: bool,
+    ) -> bool:
+        # vLLM realtime can crash if generation starts before the first audio
+        # chunk has been appended and converted into multimodal embeddings.
+        await self._append_audio_chunk(ws, chunk)
+        if generation_started:
+            return True
+        await self._start_generation(ws)
+        return True
+
     async def _capture_initial_chunk_before_commit(
         self,
         ws,
@@ -116,10 +130,11 @@ class RealtimeTranscriber:
             chunk = mic.get_chunk(timeout=0.02)
             if not chunk:
                 continue
-            if not generation_started:
-                await self._start_generation(ws)
-                generation_started = True
-            await self._append_audio_chunk(ws, chunk)
+            generation_started = await self._append_chunk_and_maybe_start_generation(
+                ws,
+                chunk,
+                generation_started,
+            )
             appended += 1
             break
         return appended, generation_started
@@ -167,10 +182,11 @@ class RealtimeTranscriber:
         while loop.time() < deadline:
             chunk = mic.get_chunk(timeout=0.02)
             if chunk:
-                if not generation_started:
-                    await self._start_generation(ws)
-                    generation_started = True
-                await self._append_audio_chunk(ws, chunk)
+                generation_started = await self._append_chunk_and_maybe_start_generation(
+                    ws,
+                    chunk,
+                    generation_started,
+                )
                 appended += 1
 
             await self._recv_once(
@@ -221,10 +237,11 @@ class RealtimeTranscriber:
                     while True:
                         chunk = mic.get_chunk(timeout=0.05)
                         if chunk:
-                            if not generation_started:
-                                await self._start_generation(ws)
-                                generation_started = True
-                            await self._append_audio_chunk(ws, chunk)
+                            generation_started = await self._append_chunk_and_maybe_start_generation(
+                                ws,
+                                chunk,
+                                generation_started,
+                            )
                             sent_audio_chunks += 1
 
                         await self._recv_once(
@@ -257,11 +274,13 @@ class RealtimeTranscriber:
                             # Flush any remaining tail audio captured right before stop.
                             tail_chunks = mic.drain()
                             if tail_chunks:
-                                if not generation_started:
-                                    await self._start_generation(ws)
-                                    generation_started = True
                                 sent_audio_chunks += len(tail_chunks)
-                                await self._append_audio_chunks(ws, tail_chunks)
+                                for index, tail_chunk in enumerate(tail_chunks):
+                                    generation_started = await self._append_chunk_and_maybe_start_generation(
+                                        ws,
+                                        tail_chunk,
+                                        generation_started if index > 0 else generation_started,
+                                    )
                             break
 
                         if generation_started and segment_max_seconds > 0 and (
@@ -358,21 +377,21 @@ class RealtimeTranscriber:
         raw_audio = self._audio_file_to_pcm16_bytes(audio_path)
         deltas: list[str] = []
         final_text: str | None = None
+        generation_started = False
+
+        if not raw_audio:
+            return ""
 
         async with await self._connect() as ws:
             await self._init_session(ws)
-            await self._start_generation(ws)
 
             chunk_size = 4096
             for i in range(0, len(raw_audio), chunk_size):
                 chunk = raw_audio[i : i + chunk_size]
-                await ws.send(
-                    json.dumps(
-                        {
-                            "type": "input_audio_buffer.append",
-                            "audio": base64.b64encode(chunk).decode("utf-8"),
-                        }
-                    )
+                generation_started = await self._append_chunk_and_maybe_start_generation(
+                    ws,
+                    chunk,
+                    generation_started,
                 )
 
             await ws.send(json.dumps({"type": "input_audio_buffer.commit", "final": True}))
