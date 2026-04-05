@@ -52,6 +52,12 @@ class EngineManager:
         command.extend(self.config.engine.extra_args)
         return command
 
+    def _distributed_host_ip(self) -> str:
+        host = self.config.server.host.strip()
+        if host in {"", "0.0.0.0", "::", "localhost"}:
+            return "127.0.0.1"
+        return host
+
     def ensure_running(self) -> None:
         if self.is_ready(timeout_seconds=2.0):
             return
@@ -98,6 +104,9 @@ class EngineManager:
         env = os.environ.copy()
         if self.config.engine.disable_compile_cache:
             env["VLLM_DISABLE_COMPILE_CACHE"] = "1"
+        # Keep vLLM's internal rendezvous on the local interface instead of
+        # auto-detecting VPN or Tailscale addresses that are not reachable.
+        env["VLLM_HOST_IP"] = self._distributed_host_ip()
 
         self.logger.info("starting vLLM: %s", " ".join(command))
 

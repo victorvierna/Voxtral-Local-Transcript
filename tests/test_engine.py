@@ -1,4 +1,5 @@
 from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -91,3 +92,32 @@ def test_wait_until_ready_timeout_clears_engine_pid(tmp_path: Path):
         manager._wait_until_ready_or_fail(777)
 
     assert state.read()["engine_pid"] is None
+
+
+def test_start_local_engine_sets_vllm_host_ip_to_loopback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    manager, state = _build_manager(tmp_path)
+    manager.config.server.host = "0.0.0.0"
+    monkeypatch.setattr("voxtray.engine.VLLM_LOG_FILE", str(tmp_path / "vllm.log"))
+
+    captured: dict[str, object] = {}
+
+    class DummyProcess:
+        pid = 4242
+
+    def _fake_popen(*args, **kwargs):
+        captured["command"] = args[0]
+        captured["env"] = kwargs["env"]
+        return DummyProcess()
+
+    monkeypatch.setattr(manager, "is_ready", lambda timeout_seconds=2.0: False)
+    monkeypatch.setattr(manager, "_wait_until_ready_or_fail", lambda pid: None)
+    monkeypatch.setattr(subprocess, "Popen", _fake_popen)
+    monkeypatch.setattr("voxtray.state.pid_is_alive", lambda pid: True)
+
+    manager.start_local_engine()
+
+    assert captured["command"] == manager._build_command()
+    assert captured["env"]["VLLM_HOST_IP"] == "127.0.0.1"
+    assert state.read()["engine_pid"] == 4242
