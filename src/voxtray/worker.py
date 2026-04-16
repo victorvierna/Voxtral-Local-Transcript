@@ -6,6 +6,7 @@ import signal
 import threading
 from uuid import uuid4
 
+from .audio import MicrophoneStream
 from .clipboard import ClipboardError, copy_to_clipboard
 from .config import load_config
 from .engine import EngineError, EngineManager
@@ -57,6 +58,7 @@ def run_record_worker() -> int:
     logger = logging.getLogger("voxtray.worker")
 
     stop_event = threading.Event()
+    mic: MicrophoneStream | None = None
 
     def _signal_handler(signum, frame) -> None:  # type: ignore[no-untyped-def]
         del signum, frame
@@ -68,9 +70,20 @@ def run_record_worker() -> int:
 
     state_store.set_values(recording_pid=os.getpid(), last_error="")
 
-    _publish_notice(state_store, "Voxtray", "Recording started")
-
     try:
+        mic = MicrophoneStream(
+            sample_rate=config.audio.sample_rate,
+            chunk_ms=config.audio.chunk_ms,
+            device=config.audio.device,
+            max_queue_chunks=config.realtime.mic_queue_chunks,
+        )
+        mic.start()
+        _publish_notice(
+            state_store,
+            "Voxtray",
+            "Recording started",
+        )
+
         text = ""
         normalized_text = ""
         max_attempts = 2
@@ -79,7 +92,11 @@ def run_record_worker() -> int:
         for attempt in range(1, max_attempts + 1):
             try:
                 engine.ensure_running()
-                text = transcriber.transcribe_microphone_blocking(stop_event=stop_event)
+                text = transcriber.transcribe_microphone_blocking(
+                    stop_event=stop_event,
+                    mic=mic,
+                    close_mic=False,
+                )
                 completed_attempt = attempt
                 break
             except (EngineError, RealtimeError) as exc:
@@ -199,6 +216,8 @@ def run_record_worker() -> int:
         )
         return 1
     finally:
+        if mic is not None:
+            mic.stop()
         state = state_store.read()
         state_store.set_values(recording_pid=None)
         if not state.get("warm_enabled"):

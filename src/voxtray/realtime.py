@@ -486,6 +486,8 @@ class RealtimeTranscriber:
         stop_event: threading.Event,
         on_delta: DeltaCallback | None = None,
         final_timeout_seconds: float | None = None,
+        mic: MicrophoneStream | None = None,
+        close_mic: bool = True,
     ) -> str:
         final_timeout = (
             final_timeout_seconds
@@ -504,12 +506,13 @@ class RealtimeTranscriber:
         capture = self._new_capture(source="microphone")
         capture.requested_segment_max_seconds = requested_segment_max_seconds
         capture.effective_segment_max_seconds = segment_max_seconds
-        mic = MicrophoneStream(
-            sample_rate=self.config.audio.sample_rate,
-            chunk_ms=self.config.audio.chunk_ms,
-            device=self.config.audio.device,
-            max_queue_chunks=self.config.realtime.mic_queue_chunks,
-        )
+        if mic is None:
+            mic = MicrophoneStream(
+                sample_rate=self.config.audio.sample_rate,
+                chunk_ms=self.config.audio.chunk_ms,
+                device=self.config.audio.device,
+                max_queue_chunks=self.config.realtime.mic_queue_chunks,
+            )
         mic.start()
         try:
             while True:
@@ -650,19 +653,24 @@ class RealtimeTranscriber:
                 capture.error_payload = exc.payload
             raise
         finally:
-            mic.stop()
+            if close_mic:
+                mic.stop()
 
     def transcribe_microphone_blocking(
         self,
         stop_event: threading.Event,
         on_delta: DeltaCallback | None = None,
         final_timeout_seconds: float | None = None,
+        mic: MicrophoneStream | None = None,
+        close_mic: bool = True,
     ) -> str:
         return asyncio.run(
             self.transcribe_microphone(
                 stop_event=stop_event,
                 on_delta=on_delta,
                 final_timeout_seconds=final_timeout_seconds,
+                mic=mic,
+                close_mic=close_mic,
             )
         )
 
