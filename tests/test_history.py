@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from voxtray.history import HistoryStore
+from voxtray.history import HistoryStore, preview_text
 
 
 def test_history_keeps_latest_max_entries(tmp_path: Path):
@@ -24,3 +24,19 @@ def test_get_by_index(tmp_path: Path):
 
     assert store.get_by_index(1)["text"] == "two"
     assert store.get_by_index(2)["text"] == "one"
+
+
+def test_preview_text_prefers_first_words() -> None:
+    text = "Vale tiene muy buena pinta pero quiero mejorar bastante esto ahora mismo"
+
+    preview = preview_text(text, max_words=6, max_chars=200)
+
+    assert preview == "Vale tiene muy buena pinta pero..."
+
+
+def test_preview_text_normalizes_whitespace_and_caps_length() -> None:
+    text = "  uno   dos \n tres   cuatro cinco seis siete ocho nueve diez once  "
+
+    preview = preview_text(text, max_words=20, max_chars=24)
+
+    assert preview == "uno dos tres cuatro..."

@@ -62,6 +62,10 @@ class Controller:
             "server_url": self.config.server_base_url,
             "model_id": self.config.model_id,
             "last_error": state.get("last_error", ""),
+            "last_notice_id": state.get("last_notice_id", ""),
+            "last_notice_title": state.get("last_notice_title", ""),
+            "last_notice_body": state.get("last_notice_body", ""),
+            "last_notice_level": state.get("last_notice_level", "info"),
         }
 
     def _spawn_record_worker(self) -> int:

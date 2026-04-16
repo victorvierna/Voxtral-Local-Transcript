@@ -55,6 +55,10 @@ class StateStore:
             "warm_enabled": True,
             "last_toggle_epoch": 0.0,
             "last_error": "",
+            "last_notice_id": "",
+            "last_notice_title": "",
+            "last_notice_body": "",
+            "last_notice_level": "info",
             "updated_at": now_utc_iso(),
         }
 

@@ -13,6 +13,27 @@ def _now_iso() -> str:
     return datetime.now(tz=timezone.utc).isoformat()
 
 
+def preview_text(text: str, *, max_words: int = 10, max_chars: int = 72) -> str:
+    compact = " ".join(text.split())
+    if not compact:
+        return "(empty)"
+
+    words = compact.split(" ")
+    preview = " ".join(words[:max_words])
+    truncated = len(words) > max_words or len(preview) < len(compact)
+
+    if len(preview) > max_chars:
+        shortened = preview[:max_chars].rstrip()
+        if " " in shortened:
+            shortened = shortened.rsplit(" ", 1)[0]
+        preview = shortened or preview[:max_chars]
+        truncated = True
+
+    if truncated:
+        preview = preview.rstrip(" .,;:") + "..."
+    return preview
+
+
 class HistoryStore:
     def __init__(self, max_items: int = 5, path: Path | None = None) -> None:
         self.max_items = max_items

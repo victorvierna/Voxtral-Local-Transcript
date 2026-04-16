@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+from datetime import datetime
 import logging
 import os
 import subprocess
@@ -8,6 +9,7 @@ import threading
 
 from .clipboard import ClipboardError, copy_to_clipboard
 from .controller import Controller
+from .history import preview_text
 
 
 def _check_linux_qt_runtime() -> None:
@@ -77,6 +79,7 @@ def run_tray(controller: Controller | None = None) -> int:
     tray.setToolTip("Voxtray")
     menu_is_open = False
     last_is_recording: bool | None = None
+    last_notice_id = ""
     refresh_interval_ms = 1500
     min_refresh_interval_ms = 1000
     max_refresh_interval_ms = 7000
@@ -196,41 +199,73 @@ def run_tray(controller: Controller | None = None) -> int:
                 interactive=True,
             )
 
-    def _copy_history(index: int) -> None:
+    def _history_entry_label(index: int, entry: dict[str, object]) -> str:
+        preview = preview_text(str(entry.get("text", "")))
+        created_at = str(entry.get("created_at", "") or "")
+        if created_at:
+            try:
+                timestamp = datetime.fromisoformat(created_at).astimezone().strftime("%H:%M")
+                return f"{index}. {preview} ({timestamp})"
+            except ValueError:
+                pass
+        return f"{index}. {preview}"
+
+    def _copy_history_entry(entry: dict[str, object], index: int) -> None:
+        text = str(entry.get("text", ""))
+        preview = preview_text(text)
         try:
-            entry = ctl.history.get_by_index(index)
-            copy_to_clipboard(
-                str(entry.get("text", "")),
-                backend=ctl.config.clipboard.backend,
-            )
+            copy_to_clipboard(text, backend=ctl.config.clipboard.backend)
             _notify(
                 "Voxtray",
-                f"Copied history item #{index}",
+                f"Copied #{index}: {preview}",
                 QSystemTrayIcon.MessageIcon.Information,
-                2500,
+                2800,
                 interactive=False,
             )
-        except (IndexError, ClipboardError):
+        except ClipboardError:
             _notify(
                 "Voxtray",
-                f"Could not copy history item #{index}",
+                f"Could not copy #{index}: {preview}",
                 QSystemTrayIcon.MessageIcon.Warning,
-                2500,
+                2800,
                 interactive=False,
             )
         except Exception:
             logger.exception("unexpected error copying history item %s", index)
             _notify(
                 "Voxtray",
-                f"Unexpected error while copying history item #{index}",
+                f"Unexpected error while copying #{index}: {preview}",
                 QSystemTrayIcon.MessageIcon.Warning,
-                3000,
+                3200,
                 interactive=False,
             )
+
+    def _rebuild_history_menu() -> None:
+        entries = ctl.list_history()
+        history_menu.clear()
+        history_menu.setTitle(f"Recent ({len(entries)})")
+        if not entries:
+            empty = QAction("No transcripts yet")
+            empty.setEnabled(False)
+            history_menu.addAction(empty)
+            return
+
+        for idx, entry in enumerate(entries, start=1):
+            action = QAction(_history_entry_label(idx, entry))
+            full_text = " ".join(str(entry.get("text", "")).split())
+            if full_text:
+                tooltip = full_text if len(full_text) <= 512 else full_text[:509] + "..."
+                action.setToolTip(tooltip)
+                action.setStatusTip(tooltip)
+            action.triggered.connect(
+                lambda checked=False, e=entry, i=idx: _copy_history_entry(e, i)
+            )
+            history_menu.addAction(action)
 
     def _refresh() -> None:
         nonlocal menu_is_open
         nonlocal last_is_recording
+        nonlocal last_notice_id
         nonlocal refresh_interval_ms
         try:
             status = ctl.status()
@@ -261,23 +296,25 @@ def run_tray(controller: Controller | None = None) -> int:
                 refresh_interval_ms = target_interval
                 refresh_timer.setInterval(refresh_interval_ms)
 
-            # Don't rebuild submenu while the user is navigating it.
-            if menu_is_open:
-                return
+            notice_id = str(status.get("last_notice_id", "") or "")
+            if notice_id and notice_id != last_notice_id:
+                last_notice_id = notice_id
+                notice_level = str(status.get("last_notice_level", "info") or "info")
+                notice_icon = {
+                    "warning": QSystemTrayIcon.MessageIcon.Warning,
+                    "error": QSystemTrayIcon.MessageIcon.Critical,
+                }.get(notice_level, QSystemTrayIcon.MessageIcon.Information)
+                notice_title = str(status.get("last_notice_title", "") or "Voxtray")
+                notice_body = str(status.get("last_notice_body", "") or "").strip()
+                if notice_body:
+                    _notify(
+                        notice_title,
+                        notice_body,
+                        notice_icon,
+                        4500,
+                        interactive=notice_level == "error",
+                    )
 
-            history_menu.clear()
-            entries = ctl.list_history()
-            if not entries:
-                empty = QAction("(empty)")
-                empty.setEnabled(False)
-                history_menu.addAction(empty)
-            else:
-                for idx, entry in enumerate(entries, start=1):
-                    text = str(entry.get("text", "")).strip().replace("\n", " ")
-                    preview = text[:64] + ("..." if len(text) > 64 else "")
-                    action = QAction(f"{idx}. {preview}")
-                    action.triggered.connect(lambda checked=False, i=idx: _copy_history(i))
-                    history_menu.addAction(action)
         except Exception:
             logger.exception("tray refresh failed")
 
@@ -289,7 +326,15 @@ def run_tray(controller: Controller | None = None) -> int:
     action_quit.triggered.connect(_quit)
     menu.aboutToShow.connect(lambda: _set_menu_open(True))
     menu.aboutToHide.connect(lambda: _set_menu_open(False))
-    history_menu.aboutToShow.connect(lambda: _set_menu_open(True))
+
+    def _on_history_menu_show() -> None:
+        _set_menu_open(True)
+        try:
+            _rebuild_history_menu()
+        except Exception:
+            logger.exception("failed rebuilding history menu")
+
+    history_menu.aboutToShow.connect(_on_history_menu_show)
     history_menu.aboutToHide.connect(lambda: _set_menu_open(False))
 
     tray.activated.connect(
@@ -303,8 +348,8 @@ def run_tray(controller: Controller | None = None) -> int:
     refresh_timer.timeout.connect(_refresh)
     refresh_timer.start()
 
-    _refresh()
     tray.show()
+    _refresh()
     _run_async(_preload_model_startup)
     _notify(
         "Voxtray",
