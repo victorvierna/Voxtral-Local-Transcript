@@ -71,17 +71,10 @@ def run_record_worker() -> int:
     state_store.set_values(recording_pid=os.getpid(), last_error="")
 
     try:
-        mic = MicrophoneStream(
-            sample_rate=config.audio.sample_rate,
-            chunk_ms=config.audio.chunk_ms,
-            device=config.audio.device,
-            max_queue_chunks=config.realtime.mic_queue_chunks,
-        )
-        mic.start()
         _publish_notice(
             state_store,
             "Voxtray",
-            "Recording started",
+            "Loading model before recording",
         )
 
         text = ""
@@ -92,6 +85,21 @@ def run_record_worker() -> int:
         for attempt in range(1, max_attempts + 1):
             try:
                 engine.ensure_running()
+                if stop_event.is_set():
+                    break
+                if mic is None:
+                    mic = MicrophoneStream(
+                        sample_rate=config.audio.sample_rate,
+                        chunk_ms=config.audio.chunk_ms,
+                        device=config.audio.device,
+                        max_queue_chunks=config.realtime.mic_queue_chunks,
+                    )
+                    mic.start()
+                    _publish_notice(
+                        state_store,
+                        "Voxtray",
+                        "Recording started",
+                    )
                 text = transcriber.transcribe_microphone_blocking(
                     stop_event=stop_event,
                     mic=mic,
