@@ -78,7 +78,7 @@ def run_tray(controller: Controller | None = None) -> int:
     tray.setContextMenu(menu)
     tray.setToolTip("Voxtray")
     menu_is_open = False
-    last_is_recording: bool | None = None
+    last_activity_state: tuple[str, bool, bool] | None = None
     last_notice_id = ""
     refresh_interval_ms = 1500
     min_refresh_interval_ms = 1000
@@ -139,6 +139,8 @@ def run_tray(controller: Controller | None = None) -> int:
                 "Voxtray Status",
                 (
                     f"recording={status['recording']} warm={status['warm_enabled']} "
+                    f"processing={status['processing']} "
+                    f"state={status['activity_state']} "
                     f"engine_ready={status['engine_ready']} "
                     f"model_loaded={status['model_loaded']}"
                 ),
@@ -264,18 +266,38 @@ def run_tray(controller: Controller | None = None) -> int:
 
     def _refresh() -> None:
         nonlocal menu_is_open
-        nonlocal last_is_recording
+        nonlocal last_activity_state
         nonlocal last_notice_id
         nonlocal refresh_interval_ms
         try:
             status = ctl.status()
             is_recording = bool(status["recording"])
-            action_toggle.setText("Stop Recording" if is_recording else "Start Recording")
+            is_processing = bool(status.get("processing"))
+            activity_state = str(status.get("activity_state") or "idle")
+            if activity_state == "loading_model":
+                action_toggle.setText("Cancel Recording")
+            elif activity_state == "copying":
+                action_toggle.setText("Copying...")
+            elif is_processing:
+                action_toggle.setText("Processing...")
+            else:
+                action_toggle.setText("Stop Recording" if is_recording else "Start Recording")
+            action_toggle.setEnabled(activity_state not in {"transcribing", "copying"})
 
-            if last_is_recording is None or last_is_recording != is_recording:
-                last_is_recording = is_recording
+            visual_state = (activity_state, is_recording, is_processing)
+            if last_activity_state is None or last_activity_state != visual_state:
+                last_activity_state = visual_state
                 tray.setIcon(recording_icon if is_recording else idle_icon)
-                tray.setToolTip("Voxtray (Recording)" if is_recording else "Voxtray")
+                if is_recording:
+                    tray.setToolTip("Voxtray (Recording)")
+                elif activity_state == "loading_model":
+                    tray.setToolTip("Voxtray (Loading model)")
+                elif activity_state == "copying":
+                    tray.setToolTip("Voxtray (Copying)")
+                elif is_processing:
+                    tray.setToolTip("Voxtray (Transcribing)")
+                else:
+                    tray.setToolTip("Voxtray")
 
             action_warm.blockSignals(True)
             action_warm.setChecked(bool(status["warm_enabled"]))
@@ -286,10 +308,14 @@ def run_tray(controller: Controller | None = None) -> int:
             action_model.blockSignals(False)
 
             # Poll quickly while recording; back off when idle to reduce load/log noise.
-            target_interval = min_refresh_interval_ms if is_recording else max_refresh_interval_ms
-            if not is_recording and not menu_is_open:
+            target_interval = (
+                min_refresh_interval_ms
+                if is_recording or is_processing
+                else max_refresh_interval_ms
+            )
+            if not is_recording and not is_processing and not menu_is_open:
                 target_interval = min(max_refresh_interval_ms, refresh_interval_ms + 500)
-            elif is_recording:
+            elif is_recording or is_processing:
                 target_interval = min_refresh_interval_ms
 
             if target_interval != refresh_interval_ms:

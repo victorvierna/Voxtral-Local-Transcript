@@ -51,6 +51,8 @@ class StateStore:
     def _default_state(self) -> dict[str, Any]:
         return {
             "recording_pid": None,
+            "recording_stop_requested": False,
+            "activity_state": "idle",
             "engine_pid": None,
             "warm_enabled": True,
             "last_toggle_epoch": 0.0,
@@ -103,6 +105,8 @@ class StateStore:
             changed = False
             if state.get("recording_pid") and not pid_is_alive(state["recording_pid"]):
                 state["recording_pid"] = None
+                state["recording_stop_requested"] = False
+                state["activity_state"] = "idle"
                 changed = True
             if state.get("engine_pid") and not pid_is_alive(state["engine_pid"]):
                 state["engine_pid"] = None

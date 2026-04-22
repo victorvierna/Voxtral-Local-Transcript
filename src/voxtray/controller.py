@@ -52,9 +52,25 @@ class Controller:
     def status(self) -> dict[str, object]:
         state = self.state_store.read()
         engine_ready = self._get_engine_ready(use_cache=True)
+        recording_pid = state.get("recording_pid")
+        activity_state = str(state.get("activity_state") or "idle")
+        stop_requested = bool(recording_pid and state.get("recording_stop_requested"))
+        is_recording = bool(
+            recording_pid and not stop_requested and activity_state == "recording"
+        )
+        is_processing = bool(
+            recording_pid
+            and (
+                stop_requested
+                or activity_state in {"transcribing", "copying"}
+            )
+        )
         return {
-            "recording": bool(state.get("recording_pid")),
-            "recording_pid": state.get("recording_pid"),
+            "recording": is_recording,
+            "processing": is_processing,
+            "activity_state": activity_state,
+            "recording_pid": recording_pid,
+            "recording_stop_requested": stop_requested,
             "warm_enabled": bool(state.get("warm_enabled")),
             "engine_pid": state.get("engine_pid"),
             "engine_ready": engine_ready,
@@ -83,6 +99,8 @@ class Controller:
         state = self.state_store.read()
         pid = state.get("recording_pid")
         if pid and pid_is_alive(pid):
+            if state.get("recording_stop_requested"):
+                return f"recording is stopping and transcribing (pid={pid})"
             return f"already recording (pid={pid})"
 
         self._spawn_record_worker()
@@ -101,18 +119,33 @@ class Controller:
         if not pid:
             return "not recording"
         if not pid_is_alive(pid):
-            self.state_store.set_values(recording_pid=None)
+            self.state_store.set_values(
+                recording_pid=None,
+                recording_stop_requested=False,
+                activity_state="idle",
+            )
             return "recording was stale and is now cleared"
-
-        os.kill(pid, signal.SIGUSR1)
+        if state.get("recording_stop_requested"):
+            message = f"recording is already stopping and transcribing (pid={pid})"
+        else:
+            os.kill(pid, signal.SIGUSR1)
+            self.state_store.set_values(
+                recording_stop_requested=True,
+                activity_state="transcribing",
+            )
+            message = f"stop signal sent to pid={pid}, still shutting down"
         deadline = time.time() + timeout_seconds
         while time.time() < deadline:
             if not pid_is_alive(pid):
-                self.state_store.set_values(recording_pid=None)
+                self.state_store.set_values(
+                    recording_pid=None,
+                    recording_stop_requested=False,
+                    activity_state="idle",
+                )
                 return "recording stopped"
             time.sleep(0.1)
 
-        return f"stop signal sent to pid={pid}, still shutting down"
+        return message
 
     def toggle_recording(self) -> str:
         state = self.state_store.read()
@@ -123,6 +156,8 @@ class Controller:
         self.state_store.set_values(last_toggle_epoch=now)
         pid = state.get("recording_pid")
         if pid and pid_is_alive(pid):
+            if state.get("recording_stop_requested"):
+                return f"recording is already stopping and transcribing (pid={pid})"
             return self.stop_recording()
         return self.start_recording()
 

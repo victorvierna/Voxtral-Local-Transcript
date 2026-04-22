@@ -9,6 +9,8 @@ def test_state_store_roundtrip(tmp_path: Path):
 
     original = store.read()
     assert original["warm_enabled"] is True
+    assert original["recording_stop_requested"] is False
+    assert original["activity_state"] == "idle"
     assert original["last_toggle_epoch"] == 0.0
     assert original["last_notice_id"] == ""
     assert original["last_notice_level"] == "info"
