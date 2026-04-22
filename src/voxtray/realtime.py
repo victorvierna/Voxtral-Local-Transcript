@@ -36,6 +36,12 @@ class TranscriptionCapture:
     effective_segment_max_seconds: float = 0.0
     pcm16_audio: bytearray = field(default_factory=bytearray)
     segment_texts: list[str] = field(default_factory=list)
+    segments: list[dict[str, object]] = field(default_factory=list)
+    events: list[dict[str, object]] = field(default_factory=list)
+    fallback_used: bool = False
+    fallback_source: str = ""
+    completion_status: str = "unknown"
+    completion_reason: str = ""
     raw_text: str = ""
     error_message: str = ""
     error_payload: object | None = None
@@ -46,8 +52,25 @@ class TranscriptionCapture:
     def audio_bytes(self) -> bytes:
         return bytes(self.pcm16_audio)
 
+    def audio_duration_seconds(self) -> float:
+        if self.sample_rate <= 0:
+            return 0.0
+        return len(self.pcm16_audio) / float(self.sample_rate * 2)
+
+    def diagnostics(self) -> dict[str, object]:
+        return {
+            "completion_status": self.completion_status,
+            "completion_reason": self.completion_reason,
+            "fallback_used": self.fallback_used,
+            "fallback_source": self.fallback_source,
+            "segments": self.segments,
+            "events": self.events,
+        }
+
 
 class RealtimeTranscriber:
+    _SEGMENT_MAX_ATTEMPTS = 2
+
     def __init__(self, config: VoxtrayConfig) -> None:
         self.config = config
         self.logger = logging.getLogger("voxtray.realtime")
@@ -66,6 +89,23 @@ class RealtimeTranscriber:
     def _audio_chunk_seconds(self) -> float:
         return max(0.001, self._audio_chunk_ms() / 1000.0)
 
+    def _audio_seconds_for_bytes(self, raw_audio: bytes) -> float:
+        bytes_per_second = max(1, self._audio_sample_rate() * 2)
+        return len(raw_audio) / float(bytes_per_second)
+
+    @staticmethod
+    def _pcm16_is_known_silence(raw_audio: bytes) -> bool:
+        if not raw_audio:
+            return True
+        even_length = len(raw_audio) - (len(raw_audio) % 2)
+        if even_length <= 0:
+            return True
+        for index in range(0, even_length, 2):
+            sample = int.from_bytes(raw_audio[index : index + 2], "little", signed=True)
+            if sample != 0:
+                return False
+        return True
+
     def _new_capture(self, source: str, input_path: Path | None = None) -> TranscriptionCapture:
         capture = TranscriptionCapture(
             source=source,
@@ -75,6 +115,81 @@ class RealtimeTranscriber:
         )
         self._last_capture = capture
         return capture
+
+    @staticmethod
+    def _rounded_seconds(value: float) -> float:
+        return round(max(0.0, value), 3)
+
+    def _record_event(
+        self,
+        capture: TranscriptionCapture | None,
+        event: str,
+        **values: object,
+    ) -> None:
+        if capture is None:
+            return
+        capture.events.append({"event": event, **values})
+
+    def _new_segment_record(
+        self,
+        capture: TranscriptionCapture,
+        *,
+        source: str,
+        audio_start_seconds: float,
+        audio_seconds: float,
+        chunk_count: int,
+        break_reason: str,
+        final_segment: bool,
+        wait_seconds: float,
+    ) -> dict[str, object]:
+        segment = {
+            "index": len(capture.segments) + 1,
+            "source": source,
+            "audio_start_seconds": self._rounded_seconds(audio_start_seconds),
+            "audio_end_seconds": self._rounded_seconds(audio_start_seconds + audio_seconds),
+            "audio_seconds": self._rounded_seconds(audio_seconds),
+            "chunk_count": chunk_count,
+            "break_reason": break_reason,
+            "final_segment": final_segment,
+            "wait_seconds": self._rounded_seconds(wait_seconds),
+            "status": "pending",
+            "text_chars": 0,
+            "attempts": [],
+        }
+        capture.segments.append(segment)
+        return segment
+
+    @staticmethod
+    def _record_segment_attempt(
+        segment: dict[str, object],
+        *,
+        attempt: int,
+        status: str,
+        timeout_seconds: float,
+        text: str = "",
+        error: str = "",
+        payload: object | None = None,
+    ) -> None:
+        attempts = segment.setdefault("attempts", [])
+        if isinstance(attempts, list):
+            item: dict[str, object] = {
+                "attempt": attempt,
+                "status": status,
+                "timeout_seconds": round(max(0.0, timeout_seconds), 3),
+                "text_chars": len(text.strip()),
+            }
+            if error:
+                item["error"] = error
+            if payload is not None:
+                item["error_payload"] = payload
+            attempts.append(item)
+
+    async def _check_realtime_session(self) -> None:
+        async with await self._connect() as ws:
+            await self._init_session(ws)
+
+    def check_realtime_session_blocking(self) -> None:
+        asyncio.run(self._check_realtime_session())
 
     def _engine_extra_args(self) -> list[str]:
         return list(getattr(getattr(self.config, "engine", None), "extra_args", []) or [])
@@ -118,10 +233,10 @@ class RealtimeTranscriber:
         final_segment: bool,
     ) -> float:
         base = max(0.5, configured_seconds)
-        dynamic = 4.0 + (max(0.0, audio_seconds) * 0.5)
+        dynamic = 8.0 + (max(0.0, audio_seconds) * 1.5)
         if final_segment:
-            dynamic += 2.0
-        return max(base, min(30.0, dynamic))
+            dynamic += 6.0
+        return max(base, min(75.0, dynamic))
 
     @staticmethod
     def _format_error_message(msg: dict[str, object]) -> str:
@@ -279,6 +394,7 @@ class RealtimeTranscriber:
         if timeout_seconds <= 0:
             return None
 
+        done_seen = False
         final_text: str | None = None
         deadline = asyncio.get_running_loop().time() + timeout_seconds
         while asyncio.get_running_loop().time() < deadline:
@@ -291,9 +407,12 @@ class RealtimeTranscriber:
                 capture=capture,
             )
             if done:
+                done_seen = True
                 final_text = text
                 break
-        if final_text is None and not deltas:
+        if done_seen:
+            return final_text if final_text is not None else "".join(deltas)
+        if not deltas:
             if allow_empty_timeout:
                 self.logger.warning(
                     "timed out waiting for transcription.done after %.1fs; treating as empty segment",
@@ -306,7 +425,16 @@ class RealtimeTranscriber:
             if capture is not None:
                 capture.error_message = message
             raise RealtimeError(message)
-        return final_text
+        partial_text = "".join(deltas).strip()
+        message = (
+            f"timed out waiting for transcription.done after {timeout_seconds:.1f}s"
+            " after receiving partial transcript"
+        )
+        if partial_text:
+            message = f"{message}: {partial_text}"
+        if capture is not None:
+            capture.error_message = message
+        raise RealtimeError(message)
 
     async def _flush_stop_tail(
         self,
@@ -414,11 +542,57 @@ class RealtimeTranscriber:
 
         return f"{existing}\n{tail}"
 
+    @staticmethod
+    def completion_problem(capture: TranscriptionCapture | None, text: str) -> str:
+        if capture is None or not text.strip():
+            return ""
+
+        failed_segments = [
+            segment
+            for segment in capture.segments
+            if str(segment.get("status", "")) in {"error", "timeout"}
+            and not bool(segment.get("recovered"))
+        ]
+        if failed_segments:
+            indexes = ", ".join(str(segment.get("index", "?")) for segment in failed_segments)
+            return f"transcription incomplete: failed segment(s) {indexes}"
+
+        effective_seconds = float(capture.effective_segment_max_seconds or 0.0)
+        duration_seconds = capture.audio_duration_seconds()
+        if effective_seconds > 0 and duration_seconds >= effective_seconds * 1.5:
+            expected_segments = int((duration_seconds + effective_seconds - 0.001) // effective_seconds)
+            if len(capture.segments) < expected_segments:
+                return (
+                    "transcription incomplete: "
+                    f"expected about {expected_segments} segment(s), got {len(capture.segments)}"
+                )
+
+        return ""
+
+    @staticmethod
+    def _should_recover_empty_stop_tail(
+        capture: TranscriptionCapture,
+        *,
+        tail_chunks: int,
+        has_existing_text: bool,
+    ) -> bool:
+        if tail_chunks <= 0 or not has_existing_text:
+            return False
+        if not capture.segments:
+            return True
+        tail_segment = capture.segments[-1]
+        return not (
+            tail_segment.get("source") == "microphone-stop-tail"
+            and tail_segment.get("status") == "empty"
+            and tail_segment.get("known_silence") is True
+        )
+
     async def _transcribe_pcm16_audio(
         self,
         raw_audio: bytes,
         *,
         timeout_seconds: float,
+        on_delta: DeltaCallback | None = None,
     ) -> str:
         if not raw_audio:
             return ""
@@ -446,11 +620,69 @@ class RealtimeTranscriber:
             final_text = await self._collect_done_text(
                 ws,
                 deltas,
-                None,
+                on_delta,
                 timeout_seconds=timeout_seconds,
             )
 
         return (final_text or "".join(deltas)).strip()
+
+    async def _retry_segment_audio(
+        self,
+        raw_audio: bytes,
+        *,
+        timeout_seconds: float,
+        segment: dict[str, object],
+        on_delta: DeltaCallback | None = None,
+        allow_empty_retry: bool = False,
+    ) -> str:
+        retry_timeout = max(
+            timeout_seconds,
+            self._audio_seconds_for_bytes(raw_audio) + 20.0,
+        )
+        last_error: RealtimeError | None = None
+        for attempt in range(2, self._SEGMENT_MAX_ATTEMPTS + 1):
+            try:
+                text = await self._transcribe_pcm16_audio(
+                    raw_audio,
+                    timeout_seconds=retry_timeout,
+                    on_delta=on_delta,
+                )
+            except RealtimeError as exc:
+                last_error = exc
+                self._record_segment_attempt(
+                    segment,
+                    attempt=attempt,
+                    status="error",
+                    timeout_seconds=retry_timeout,
+                    error=str(exc),
+                    payload=exc.payload,
+                )
+                continue
+
+            self._record_segment_attempt(
+                segment,
+                attempt=attempt,
+                status="success" if text.strip() else "empty",
+                timeout_seconds=retry_timeout,
+                text=text,
+            )
+            if not text.strip():
+                if allow_empty_retry:
+                    segment["status"] = "empty"
+                    segment["text_chars"] = 0
+                    return ""
+                message = "segment retry returned empty transcript after previous failure"
+                segment["status"] = "error"
+                segment.setdefault("error", message)
+                raise RealtimeError(message)
+            segment["status"] = "recovered"
+            segment["text_chars"] = len(text.strip())
+            segment["recovered"] = True
+            return text
+
+        if last_error is not None:
+            raise last_error
+        raise RealtimeError("segment retry failed without error detail")
 
     async def _recover_final_tail_text(
         self,
@@ -497,6 +729,8 @@ class RealtimeTranscriber:
         final_text: str | None = None
         sent_audio_chunks = 0
         generation_started = False
+        segment_start_seconds = capture.audio_duration_seconds()
+        segment_start_bytes = len(capture.pcm16_audio)
 
         async with await self._connect() as ws:
             await self._init_session(ws)
@@ -559,16 +793,52 @@ class RealtimeTranscriber:
                 configured_seconds=final_timeout_seconds,
                 final_segment=True,
             )
-            final_text = await self._collect_done_text(
-                ws,
-                deltas,
-                on_delta,
+            segment_audio = capture.audio_bytes()[segment_start_bytes:]
+            segment_record = self._new_segment_record(
+                capture,
+                source="microphone-stop-tail",
+                audio_start_seconds=segment_start_seconds,
+                audio_seconds=self._audio_seconds_for_bytes(segment_audio),
+                chunk_count=sent_audio_chunks,
+                break_reason="stop_tail",
+                final_segment=True,
+                wait_seconds=wait_seconds,
+            )
+            try:
+                final_text = await self._collect_done_text(
+                    ws,
+                    deltas,
+                    on_delta,
+                    timeout_seconds=wait_seconds,
+                    capture=capture,
+                    allow_empty_timeout=True,
+                )
+            except RealtimeError as exc:
+                segment_record["status"] = "error"
+                segment_record["error"] = str(exc)
+                self._record_segment_attempt(
+                    segment_record,
+                    attempt=1,
+                    status="error",
+                    timeout_seconds=wait_seconds,
+                    error=str(exc),
+                    payload=exc.payload,
+                )
+                raise
+
+            tail_text = (final_text or "".join(deltas)).strip()
+            segment_record["known_silence"] = self._pcm16_is_known_silence(segment_audio)
+            segment_record["status"] = "success" if tail_text else "empty"
+            segment_record["text_chars"] = len(tail_text)
+            self._record_segment_attempt(
+                segment_record,
+                attempt=1,
+                status=str(segment_record["status"]),
                 timeout_seconds=wait_seconds,
-                capture=capture,
-                allow_empty_timeout=True,
+                text=tail_text,
             )
 
-        return (final_text or "".join(deltas)).strip(), sent_audio_chunks
+        return tail_text, sent_audio_chunks
 
     async def transcribe_microphone(
         self,
@@ -611,6 +881,8 @@ class RealtimeTranscriber:
                 sent_audio_chunks = 0
                 generation_started = False
                 segment_break_reason = ""
+                segment_start_seconds = capture.audio_duration_seconds()
+                segment_start_bytes = len(capture.pcm16_audio)
 
                 async with await self._connect() as ws:
                     await self._init_session(ws)
@@ -705,18 +977,69 @@ class RealtimeTranscriber:
                         ),
                         final_segment=stop_event.is_set(),
                     )
-                    allow_empty_timeout = bool(stop_event.is_set()) or (
-                        segment_max_seconds > 0
-                        and segment_audio_seconds >= (segment_max_seconds * 0.9)
+                    allow_empty_timeout = bool(stop_event.is_set()) and (
+                        segment_audio_seconds < 1.0
                     )
-                    final_text = await self._collect_done_text(
-                        ws,
-                        deltas,
-                        on_delta,
-                        timeout_seconds=wait_seconds,
-                        capture=capture,
-                        allow_empty_timeout=allow_empty_timeout,
+                    segment_audio = capture.audio_bytes()[segment_start_bytes:]
+                    segment_record = self._new_segment_record(
+                        capture,
+                        source="microphone-live",
+                        audio_start_seconds=segment_start_seconds,
+                        audio_seconds=self._audio_seconds_for_bytes(segment_audio),
+                        chunk_count=sent_audio_chunks,
+                        break_reason=segment_break_reason,
+                        final_segment=stop_event.is_set(),
+                        wait_seconds=wait_seconds,
                     )
+                    try:
+                        final_text = await self._collect_done_text(
+                            ws,
+                            deltas,
+                            on_delta,
+                            timeout_seconds=wait_seconds,
+                            capture=capture,
+                            allow_empty_timeout=allow_empty_timeout,
+                        )
+                    except RealtimeError as exc:
+                        segment_record["status"] = "error"
+                        segment_record["error"] = str(exc)
+                        self._record_segment_attempt(
+                            segment_record,
+                            attempt=1,
+                            status="error",
+                            timeout_seconds=wait_seconds,
+                            error=str(exc),
+                            payload=exc.payload,
+                        )
+                        if not segment_audio:
+                            raise
+                        final_text = await self._retry_segment_audio(
+                            segment_audio,
+                            timeout_seconds=wait_seconds,
+                            segment=segment_record,
+                            on_delta=on_delta,
+                            allow_empty_retry=(
+                                allow_empty_timeout
+                                and not deltas
+                                and str(exc).startswith(
+                                    "timed out waiting for transcription.done"
+                                )
+                            ),
+                        )
+                        deltas = []
+                    else:
+                        segment_text_for_diagnostic = (final_text or "".join(deltas)).strip()
+                        segment_record["status"] = (
+                            "success" if segment_text_for_diagnostic else "empty"
+                        )
+                        segment_record["text_chars"] = len(segment_text_for_diagnostic)
+                        self._record_segment_attempt(
+                            segment_record,
+                            attempt=1,
+                            status=str(segment_record["status"]),
+                            timeout_seconds=wait_seconds,
+                            text=segment_text_for_diagnostic,
+                        )
 
                 segment_text = (final_text or "".join(deltas)).strip()
                 if segment_text:
@@ -774,7 +1097,11 @@ class RealtimeTranscriber:
                                 )
                                 all_segments = [merged_text]
                             capture.segment_texts.append(tail_text)
-                        elif tail_chunks > 0 and all_segments:
+                        elif self._should_recover_empty_stop_tail(
+                            capture,
+                            tail_chunks=tail_chunks,
+                            has_existing_text=bool(all_segments),
+                        ):
                             recovered_text, recovered_tail = await self._recover_final_tail_text(
                                 capture,
                                 existing_text,
@@ -789,13 +1116,28 @@ class RealtimeTranscriber:
             if completion_failed_error:
                 if not capture.error_message:
                     capture.error_message = completion_failed_error
+                capture.completion_status = "incomplete"
+                capture.completion_reason = completion_failed_error
                 raise RealtimeError(
                     f"transcription incomplete after backend failure: {completion_failed_error}",
                     payload=capture.error_payload,
                 )
+            completion_problem = self.completion_problem(capture, final_text_value)
+            if completion_problem:
+                capture.error_message = completion_problem
+                capture.completion_status = "incomplete"
+                capture.completion_reason = completion_problem
+                raise RealtimeError(completion_problem, payload=capture.error_payload)
+            capture.completion_status = "complete" if final_text_value.strip() else "empty"
+            capture.completion_reason = ""
+            capture.error_message = ""
+            capture.error_payload = None
             return final_text_value
         except RealtimeError as exc:
             capture.raw_text = "\n".join(all_segments)
+            if not capture.completion_status or capture.completion_status == "unknown":
+                capture.completion_status = "incomplete"
+                capture.completion_reason = str(exc)
             if not capture.error_message:
                 capture.error_message = str(exc)
             if capture.error_payload is None and getattr(exc, "payload", None) is not None:
@@ -876,51 +1218,97 @@ class RealtimeTranscriber:
 
         try:
             segment_texts: list[str] = []
+            audio_start_seconds = 0.0
             for segment_audio in self._split_pcm16_audio(
                 raw_audio, effective_segment_max_seconds
             ):
-                deltas: list[str] = []
-                final_text: str | None = None
-                generation_started = False
+                segment_seconds = self._audio_seconds_for_bytes(segment_audio)
+                max_wait_seconds = max(
+                    15.0,
+                    self.config.realtime.final_timeout_seconds,
+                    segment_seconds + 10.0,
+                )
+                segment_record = self._new_segment_record(
+                    capture,
+                    source="file",
+                    audio_start_seconds=audio_start_seconds,
+                    audio_seconds=segment_seconds,
+                    chunk_count=max(1, (len(segment_audio) + 4095) // 4096),
+                    break_reason="file_segment",
+                    final_segment=False,
+                    wait_seconds=max_wait_seconds,
+                )
+                audio_start_seconds += segment_seconds
 
-                async with await self._connect() as ws:
-                    await self._init_session(ws)
-
-                    chunk_size = 4096
-                    for i in range(0, len(segment_audio), chunk_size):
-                        chunk = segment_audio[i : i + chunk_size]
-                        generation_started = await self._append_chunk_and_maybe_start_generation(
-                            ws,
-                            chunk,
-                            generation_started,
+                segment_text = ""
+                for attempt in range(1, self._SEGMENT_MAX_ATTEMPTS + 1):
+                    try:
+                        segment_text = await self._transcribe_pcm16_audio(
+                            segment_audio,
+                            timeout_seconds=max_wait_seconds,
+                            on_delta=on_delta,
                         )
-
-                    if not generation_started:
+                    except RealtimeError as exc:
+                        self._record_segment_attempt(
+                            segment_record,
+                            attempt=attempt,
+                            status="error",
+                            timeout_seconds=max_wait_seconds,
+                            error=str(exc),
+                            payload=exc.payload,
+                        )
+                        segment_record["status"] = "error"
+                        segment_record["error"] = str(exc)
+                        if attempt >= self._SEGMENT_MAX_ATTEMPTS:
+                            raise
+                        max_wait_seconds = max(max_wait_seconds, segment_seconds + 20.0)
                         continue
 
-                    await ws.send(json.dumps({"type": "input_audio_buffer.commit", "final": True}))
-
-                    max_wait_seconds = max(
-                        15.0,
-                        self.config.realtime.final_timeout_seconds,
-                        (len(segment_audio) / (self._audio_sample_rate() * 2)) + 10.0,
-                    )
-                    final_text = await self._collect_done_text(
-                        ws,
-                        deltas,
-                        on_delta,
+                    segment_text = segment_text.strip()
+                    self._record_segment_attempt(
+                        segment_record,
+                        attempt=attempt,
+                        status="success" if segment_text else "empty",
                         timeout_seconds=max_wait_seconds,
-                        capture=capture,
+                        text=segment_text,
                     )
+                    if not segment_text:
+                        if attempt > 1 and segment_record.get("error"):
+                            message = (
+                                "file segment retry returned empty transcript after previous failure"
+                            )
+                            segment_record["status"] = "error"
+                            raise RealtimeError(message, payload=capture.error_payload)
+                        segment_record["status"] = "empty"
+                        segment_record["text_chars"] = 0
+                    else:
+                        segment_record["status"] = "success"
+                        if attempt > 1:
+                            segment_record["status"] = "recovered"
+                            segment_record["recovered"] = True
+                        segment_record["text_chars"] = len(segment_text)
+                    break
 
-                segment_text = (final_text or "".join(deltas)).strip()
                 if segment_text:
                     segment_texts.append(segment_text)
                     capture.segment_texts.append(segment_text)
 
             capture.raw_text = "\n".join(segment_texts)
+            completion_problem = self.completion_problem(capture, capture.raw_text)
+            if completion_problem:
+                capture.error_message = completion_problem
+                capture.completion_status = "incomplete"
+                capture.completion_reason = completion_problem
+                raise RealtimeError(completion_problem, payload=capture.error_payload)
+            capture.completion_status = "complete" if capture.raw_text.strip() else "empty"
+            capture.completion_reason = ""
+            capture.error_message = ""
+            capture.error_payload = None
             return capture.raw_text
         except RealtimeError as exc:
+            if not capture.completion_status or capture.completion_status == "unknown":
+                capture.completion_status = "incomplete"
+                capture.completion_reason = str(exc)
             if not capture.error_message:
                 capture.error_message = str(exc)
             if capture.error_payload is None and getattr(exc, "payload", None) is not None:

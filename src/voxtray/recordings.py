@@ -83,6 +83,7 @@ class RecordingArtifactStore:
         requested_segment_max_seconds: float = 0.0,
         effective_segment_max_seconds: float = 0.0,
         segment_texts: list[str] | None = None,
+        diagnostics: dict[str, Any] | None = None,
         input_path: Path | None = None,
     ) -> SavedRecordingArtifact:
         artifact_dir = self._new_artifact_dir()
@@ -114,6 +115,7 @@ class RecordingArtifactStore:
             "requested_segment_max_seconds": requested_segment_max_seconds,
             "effective_segment_max_seconds": effective_segment_max_seconds,
             "segment_texts": list(segment_texts or []),
+            "diagnostics": self._sanitize_json(diagnostics or {}),
             "input_path": str(input_path) if input_path else "",
         }
         metadata_path.write_text(
