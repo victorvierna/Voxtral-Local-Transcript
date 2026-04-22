@@ -828,3 +828,47 @@ def test_completion_problem_accepts_recorded_stop_tail_segment() -> None:
     problem = RealtimeTranscriber.completion_problem(capture, "texto completo")
 
     assert problem == ""
+
+
+def test_completion_problem_allows_chunk_boundary_rollover_slack() -> None:
+    transcriber = _make_transcriber()
+    capture = transcriber._new_capture(source="microphone")
+    capture.effective_segment_max_seconds = 120.0
+    capture.append_audio_chunk(b"\x01\x00" * int(16000 * 240.04))
+    capture.segments.extend(
+        [
+            {
+                "index": 1,
+                "source": "microphone-live",
+                "status": "success",
+                "audio_seconds": 120.04,
+            },
+            {
+                "index": 2,
+                "source": "microphone-live",
+                "status": "success",
+                "audio_seconds": 120.0,
+            },
+        ]
+    )
+
+    problem = RealtimeTranscriber.completion_problem(capture, "texto completo")
+
+    assert problem == ""
+
+
+def test_completion_problem_still_detects_missing_segment_past_rollover_slack() -> None:
+    transcriber = _make_transcriber()
+    capture = transcriber._new_capture(source="microphone")
+    capture.effective_segment_max_seconds = 120.0
+    capture.append_audio_chunk(b"\x01\x00" * int(16000 * 240.5))
+    capture.segments.extend(
+        [
+            {"index": 1, "source": "microphone-live", "status": "success"},
+            {"index": 2, "source": "microphone-live", "status": "success"},
+        ]
+    )
+
+    problem = RealtimeTranscriber.completion_problem(capture, "texto parcial")
+
+    assert "expected about 3" in problem

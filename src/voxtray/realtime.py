@@ -560,7 +560,18 @@ class RealtimeTranscriber:
         effective_seconds = float(capture.effective_segment_max_seconds or 0.0)
         duration_seconds = capture.audio_duration_seconds()
         if effective_seconds > 0 and duration_seconds >= effective_seconds * 1.5:
-            expected_segments = int((duration_seconds + effective_seconds - 0.001) // effective_seconds)
+            rollover_slack_seconds = max(
+                0.001,
+                (capture.chunk_ms or 0) / 1000.0,
+            )
+            adjusted_duration_seconds = max(
+                0.0,
+                duration_seconds - rollover_slack_seconds,
+            )
+            expected_segments = int(
+                (adjusted_duration_seconds + effective_seconds - 0.001)
+                // effective_seconds
+            )
             if len(capture.segments) < expected_segments:
                 return (
                     "transcription incomplete: "
