@@ -41,4 +41,6 @@ extra_args = [
     "512",
     "--max-num-seqs",
     "1",
+    "--disable-access-log-for-endpoints",
+    "/v1/models",
 ]
