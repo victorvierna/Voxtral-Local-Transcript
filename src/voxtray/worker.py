@@ -18,6 +18,10 @@ from . import realtime as realtime_module
 from .realtime import RealtimeError, RealtimeTranscriber, TranscriptionCapture
 from .state import StateStore
 
+NO_MIC_SIGNAL_MESSAGE = (
+    "No microphone signal detected. Check mic mute, volume, and selected input."
+)
+
 
 def _publish_notice(
     state_store: StateStore,
@@ -47,6 +51,33 @@ def _is_recoverable_runtime_failure(exc: Exception) -> bool:
             "internal error",
         )
     )
+
+
+def _missing_microphone_signal_message(
+    capture: TranscriptionCapture | None,
+) -> str:
+    if capture is None or capture.source != "microphone":
+        return ""
+    if not capture.lacks_input_signal():
+        return ""
+    return NO_MIC_SIGNAL_MESSAGE
+
+
+def _mark_missing_microphone_signal(capture: TranscriptionCapture | None) -> str:
+    message = _missing_microphone_signal_message(capture)
+    if not message or capture is None:
+        return ""
+    capture.completion_status = "empty"
+    capture.completion_reason = message
+    capture.error_message = message
+    if not any(event.get("event") == "microphone_signal_missing" for event in capture.events):
+        capture.events.append(
+            {
+                "event": "microphone_signal_missing",
+                "audio_signal": capture.audio_signal_stats(),
+            }
+        )
+    return message
 
 
 def run_record_worker() -> int:
@@ -111,6 +142,18 @@ def run_record_worker() -> int:
     def _engine_ready_for_recording() -> bool:
         return engine.is_ready(timeout_seconds=1.5)
 
+    recording_stop_state_published = False
+
+    def _publish_recording_stopped_state() -> None:
+        nonlocal recording_stop_state_published
+        if recording_stop_state_published:
+            return
+        recording_stop_state_published = True
+        state_store.set_values(
+            recording_stop_requested=True,
+            activity_state="transcribing",
+        )
+
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
     signal.signal(signal.SIGUSR1, _signal_handler)
@@ -167,12 +210,10 @@ def run_record_worker() -> int:
                     stop_event=stop_event,
                     mic=mic,
                     close_mic=False,
+                    on_recording_stopped=_publish_recording_stopped_state,
                 )
                 if stop_event.is_set():
-                    state_store.set_values(
-                        recording_stop_requested=True,
-                        activity_state="transcribing",
-                    )
+                    _publish_recording_stopped_state()
                 completed_attempt = attempt
                 break
             except (EngineError, RealtimeError) as exc:
@@ -181,6 +222,11 @@ def run_record_worker() -> int:
                 artifact = None
                 if isinstance(exc, RealtimeError) and stop_event.is_set():
                     _stop_mic_and_append_queued_audio(capture)
+                    if _mark_missing_microphone_signal(capture):
+                        text = ""
+                        completed_attempt = attempt
+                        logger.warning("recording stopped with no microphone signal")
+                        break
                 if capture is not None:
                     artifact = _save_capture_artifact(
                         capture,
@@ -299,8 +345,10 @@ def run_record_worker() -> int:
             normalized_text = text
 
         capture = transcriber.last_capture
+        missing_signal_message = ""
         if capture is not None:
             capture.raw_text = text
+            missing_signal_message = _mark_missing_microphone_signal(capture)
             completion_problem = realtime_module.RealtimeTranscriber.completion_problem(
                 capture,
                 normalized_text,
@@ -321,7 +369,7 @@ def run_record_worker() -> int:
                 normalized_text="" if completion_problem else normalized_text,
                 attempt=completed_attempt,
                 max_attempts=max_attempts,
-                error=capture.error_message,
+                error=missing_signal_message or capture.error_message,
                 error_payload=capture.error_payload,
             )
             saved_artifact_path = str(artifact.directory)
@@ -352,16 +400,28 @@ def run_record_worker() -> int:
                 )
         else:
             logger.warning("recording finished without transcript text")
-            state_store.set_values(
-                last_error="No text detected. Verify mic input and hold recording slightly longer."
-            )
-            _publish_notice(
-                state_store,
-                "Voxtray",
-                "Recording stopped (no text). Try speaking 1-2 seconds before releasing.",
-                level="warning",
-                urgency="normal",
-            )
+            if missing_signal_message:
+                state_store.set_values(last_error=missing_signal_message)
+                _publish_notice(
+                    state_store,
+                    "Voxtray",
+                    missing_signal_message,
+                    level="warning",
+                    urgency="normal",
+                )
+            else:
+                state_store.set_values(
+                    last_error=(
+                        "No text detected. Verify mic input and hold recording slightly longer."
+                    )
+                )
+                _publish_notice(
+                    state_store,
+                    "Voxtray",
+                    "Recording stopped (no text). Try speaking 1-2 seconds before releasing.",
+                    level="warning",
+                    urgency="normal",
+                )
 
     except (EngineError, RealtimeError, OSError, RuntimeError) as exc:
         logger.exception("record worker failed: %s", exc)

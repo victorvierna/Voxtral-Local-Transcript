@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from voxtray.realtime import RealtimeError, RealtimeTranscriber
+from voxtray.realtime import RealtimeError, RealtimeTranscriber, TranscriptionCapture
 
 
 class FakeWebSocket:
@@ -81,6 +81,34 @@ def test_check_realtime_session_uses_realtime_websocket(monkeypatch) -> None:
             }
         )
     ]
+
+
+def test_capture_diagnostics_include_audio_signal_stats() -> None:
+    capture = TranscriptionCapture(source="microphone", sample_rate=16000, chunk_ms=40)
+    capture.append_audio_chunk(b"\x00\x00" * 16000)
+
+    stats = capture.diagnostics()["audio_signal"]
+
+    assert stats["duration_seconds"] == 1.0
+    assert stats["sample_count"] == 16000
+    assert stats["nonzero_samples"] == 0
+    assert stats["peak"] == 0
+    assert stats["rms"] == 0.0
+    assert stats["has_signal"] is False
+
+
+def test_capture_signal_stats_detect_nonzero_audio() -> None:
+    capture = TranscriptionCapture(source="microphone", sample_rate=16000, chunk_ms=40)
+    capture.append_audio_chunk(b"\x00\x00" * 8000)
+    capture.append_audio_chunk((1024).to_bytes(2, "little", signed=True) * 8000)
+
+    stats = capture.audio_signal_stats()
+
+    assert stats["duration_seconds"] == 1.0
+    assert stats["nonzero_samples"] == 8000
+    assert stats["peak"] == 1024
+    assert stats["has_signal"] is True
+    assert capture.lacks_input_signal() is False
 
 
 def test_start_generation_uses_non_final_commit() -> None:
@@ -207,11 +235,11 @@ class FakeRealtimeWebSocket:
         if not self._session_sent:
             self._session_sent = True
             return json.dumps({"type": "session.created"})
-        if self._final_committed and not self._done_sent:
-            self._done_sent = True
-            return json.dumps({"type": "transcription.done", "text": self.done_text})
-        await asyncio.sleep(3600)
-        return ""
+        while True:
+            if self._final_committed and not self._done_sent:
+                self._done_sent = True
+                return json.dumps({"type": "transcription.done", "text": self.done_text})
+            await asyncio.sleep(0.001)
 
     async def send(self, payload: str) -> None:
         self.sent.append(payload)
@@ -235,17 +263,17 @@ class FakeErrorRealtimeWebSocket(FakeRealtimeWebSocket):
         if not self._session_sent:
             self._session_sent = True
             return json.dumps({"type": "session.created"})
-        if self._final_committed and not self._done_sent:
-            self._done_sent = True
-            return json.dumps(
-                {
-                    "type": "error",
-                    "error": self.error_message,
-                    "code": "processing_error",
-                }
-            )
-        await asyncio.sleep(3600)
-        return ""
+        while True:
+            if self._final_committed and not self._done_sent:
+                self._done_sent = True
+                return json.dumps(
+                    {
+                        "type": "error",
+                        "error": self.error_message,
+                        "code": "processing_error",
+                    }
+                )
+            await asyncio.sleep(0.001)
 
 
 class FakeMicrophone:
@@ -272,24 +300,41 @@ class FakeMicrophone:
         return chunks
 
 
-def test_effective_segment_max_seconds_clamps_to_model_budget() -> None:
+def test_effective_segment_max_seconds_uses_voxtral_realtime_token_budget() -> None:
     transcriber = _make_transcriber()
 
     effective = transcriber._effective_segment_max_seconds(90)
 
-    assert effective == pytest.approx(24.576, rel=1e-3)
+    assert effective == pytest.approx(73.728, rel=1e-3)
+    assert transcriber._effective_segment_max_seconds(120) == pytest.approx(
+        73.728,
+        rel=1e-3,
+    )
+    transcriber.config.engine.extra_args.extend(["--max-num-batched-tokens", "512"])
+    assert transcriber._effective_segment_max_seconds(90) == pytest.approx(
+        24.576,
+        rel=1e-3,
+    )
 
 
-def test_live_finalize_wait_seconds_scales_with_audio_length() -> None:
-    transcriber = _make_transcriber()
-
-    wait_seconds = transcriber._live_finalize_wait_seconds(
-        audio_seconds=24.576,
+def test_stream_finalize_wait_seconds_extends_rollover_budget() -> None:
+    wait_seconds = RealtimeTranscriber._stream_finalize_wait_seconds(
+        audio_seconds=90.0,
         configured_seconds=6.0,
         final_segment=False,
     )
 
-    assert wait_seconds == pytest.approx(44.864, rel=1e-3)
+    assert wait_seconds == pytest.approx(45.0)
+
+
+def test_stream_finalize_wait_seconds_extends_spoken_final_budget() -> None:
+    wait_seconds = RealtimeTranscriber._stream_finalize_wait_seconds(
+        audio_seconds=2.0,
+        configured_seconds=8.0,
+        final_segment=True,
+    )
+
+    assert wait_seconds == pytest.approx(16.0)
 
 
 def test_collect_done_text_can_treat_timeout_as_empty_segment() -> None:
@@ -364,16 +409,6 @@ def test_merge_tail_text_appends_only_missing_words() -> None:
     assert merged.casefold().count("perfecto") == 1
 
 
-def test_tail_pcm16_audio_uses_recent_context_window() -> None:
-    transcriber = _make_transcriber()
-    raw_audio = b"".join(bytes([i % 256, 0]) for i in range(16000 * 10))
-
-    tail = transcriber._tail_pcm16_audio(raw_audio, seconds=2.0)
-
-    assert len(tail) == 16000 * 2 * 2
-    assert tail == raw_audio[-len(tail) :]
-
-
 def test_recv_once_error_uses_serialized_payload_when_message_is_empty() -> None:
     transcriber = _make_transcriber()
     ws = FakeQueuedWebSocket([{"type": "error", "error": {}}])
@@ -392,6 +427,47 @@ def test_recv_once_error_uses_serialized_payload_when_message_is_empty() -> None
 
     assert '"type": "error"' in str(excinfo.value)
     assert capture.error_payload == {"type": "error", "error": {}}
+
+
+def test_transcribe_microphone_skips_final_commit_when_audio_has_no_signal(
+    monkeypatch,
+) -> None:
+    transcriber = _make_transcriber()
+    transcriber.config.realtime.stop_tail_ms = 0
+    stop_event = threading.Event()
+    stop_event.set()
+    mic = FakeMicrophone([b"\x00\x00" * 16000])
+    ws = FakeRealtimeWebSocket("should not be used")
+
+    async def fake_connect():
+        return ws
+
+    monkeypatch.setattr(transcriber, "_connect", fake_connect)
+
+    text = asyncio.run(
+        transcriber.transcribe_microphone(
+            stop_event=stop_event,
+            mic=mic,
+        )
+    )
+
+    final_commits = [
+        payload
+        for payload in ws.sent
+        if json.loads(payload).get("type") == "input_audio_buffer.commit"
+        and json.loads(payload).get("final") is True
+    ]
+    assert text == ""
+    assert final_commits == []
+    assert mic.stopped is True
+    assert transcriber.last_capture is not None
+    assert transcriber.last_capture.lacks_input_signal() is True
+    assert transcriber.last_capture.events == [
+        {
+            "event": "microphone_signal_missing",
+            "audio_signal": transcriber.last_capture.audio_signal_stats(),
+        }
+    ]
 
 
 def test_stop_after_segment_rollover_transcribes_queued_tail(monkeypatch) -> None:
@@ -434,14 +510,15 @@ def test_stop_after_segment_rollover_transcribes_queued_tail(monkeypatch) -> Non
     ]
     assert [segment["source"] for segment in transcriber.last_capture.segments] == [
         "microphone-live",
-        "microphone-stop-tail",
+        "microphone-live",
     ]
+    assert transcriber.last_capture.segments[1]["break_reason"] == "stop"
     assert transcriber.last_capture.segments[1]["status"] == "success"
     assert mic.started is True
-    assert mic.stopped is False
+    assert mic.stopped is True
 
 
-def test_empty_retry_after_partial_failure_keeps_segment_incomplete(monkeypatch) -> None:
+def test_empty_retry_after_partial_stop_failure_keeps_segment_incomplete(monkeypatch) -> None:
     transcriber = _make_transcriber()
     transcriber.config.realtime.stop_tail_ms = 0
     stop_event = threading.Event()
@@ -453,15 +530,14 @@ def test_empty_retry_after_partial_failure_keeps_segment_incomplete(monkeypatch)
         return ws
 
     async def partial_timeout(
-        ws,
-        deltas,
-        on_delta,
+        receive_task,
+        receive_state,
         timeout_seconds,
         capture=None,
         allow_empty_timeout=False,
     ):
-        del ws, on_delta, timeout_seconds, capture, allow_empty_timeout
-        deltas.append("texto parcial")
+        del receive_task, timeout_seconds, capture, allow_empty_timeout
+        receive_state.deltas.append("texto parcial")
         raise RealtimeError("timed out waiting for transcription.done after partial")
 
     async def empty_retry_audio(raw_audio, *, timeout_seconds, on_delta=None):
@@ -469,7 +545,7 @@ def test_empty_retry_after_partial_failure_keeps_segment_incomplete(monkeypatch)
         return ""
 
     monkeypatch.setattr(transcriber, "_connect", fake_connect)
-    monkeypatch.setattr(transcriber, "_collect_done_text", partial_timeout)
+    monkeypatch.setattr(transcriber, "_collect_stream_done_text", partial_timeout)
     monkeypatch.setattr(transcriber, "_transcribe_pcm16_audio", empty_retry_audio)
 
     with pytest.raises(RealtimeError, match="empty transcript"):
@@ -489,10 +565,7 @@ def test_empty_retry_after_partial_failure_keeps_segment_incomplete(monkeypatch)
     attempt_statuses = [
         attempt["status"] for attempt in transcriber.last_capture.segments[0]["attempts"]
     ]
-    assert attempt_statuses == [
-        "error",
-        "empty",
-    ]
+    assert attempt_statuses == ["error", "empty"]
 
 
 def test_segment_rollover_timeout_is_not_returned_as_success(monkeypatch) -> None:
@@ -533,17 +606,14 @@ def test_segment_rollover_timeout_is_not_returned_as_success(monkeypatch) -> Non
     assert mic.stopped is False
 
 
-def test_stop_with_text_recovers_final_tail(monkeypatch) -> None:
+def test_stop_with_text_uses_single_streaming_session(monkeypatch) -> None:
     transcriber = _make_transcriber()
     transcriber.config.realtime.stop_tail_ms = 0
     stop_event = threading.Event()
     stop_event.set()
     mic = FakeMicrophone([b"\x01\x00" * 320])
 
-    sockets = [
-        FakeRealtimeWebSocket("principio"),
-        FakeRealtimeWebSocket("principio final completo"),
-    ]
+    sockets = [FakeRealtimeWebSocket("principio final completo")]
 
     async def fake_connect():
         return sockets.pop(0)
@@ -559,11 +629,59 @@ def test_stop_with_text_recovers_final_tail(monkeypatch) -> None:
     )
 
     assert text == "principio final completo"
+    assert sockets == []
     assert transcriber.last_capture is not None
     assert transcriber.last_capture.segment_texts == [
-        "principio",
         "principio final completo",
     ]
+    assert len(transcriber.last_capture.segments) == 1
+    assert mic.stopped is True
+
+
+def test_transcribe_microphone_forwards_streaming_deltas(monkeypatch) -> None:
+    transcriber = _make_transcriber()
+    transcriber.config.realtime.stop_tail_ms = 0
+    stop_event = threading.Event()
+    stop_event.set()
+    mic = FakeMicrophone([b"\x01\x00" * 320])
+
+    class DeltaThenDoneRealtimeWebSocket(FakeRealtimeWebSocket):
+        def __init__(self) -> None:
+            super().__init__("hola mundo")
+            self._delta_sent = False
+
+        async def recv(self) -> str:
+            if not self._session_sent:
+                self._session_sent = True
+                return json.dumps({"type": "session.created"})
+            while True:
+                if self._final_committed and not self._delta_sent:
+                    self._delta_sent = True
+                    return json.dumps({"type": "transcription.delta", "delta": "hola "})
+                if self._final_committed and not self._done_sent:
+                    self._done_sent = True
+                    return json.dumps(
+                        {"type": "transcription.done", "text": "hola mundo"}
+                    )
+                await asyncio.sleep(0.001)
+
+    async def fake_connect():
+        return DeltaThenDoneRealtimeWebSocket()
+
+    deltas: list[str] = []
+    monkeypatch.setattr(transcriber, "_connect", fake_connect)
+
+    text = asyncio.run(
+        transcriber.transcribe_microphone(
+            stop_event=stop_event,
+            mic=mic,
+            close_mic=False,
+            on_delta=deltas.append,
+        )
+    )
+
+    assert text == "hola mundo"
+    assert deltas == ["hola "]
 
 
 def test_post_rollover_tail_backend_error_is_not_returned_as_success(
@@ -591,7 +709,7 @@ def test_post_rollover_tail_backend_error_is_not_returned_as_success(
 
     monkeypatch.setattr(transcriber, "_connect", fake_connect)
 
-    with pytest.raises(RealtimeError, match="transcription incomplete"):
+    with pytest.raises(RealtimeError, match="EngineCore"):
         asyncio.run(
             transcriber.transcribe_microphone(
                 stop_event=stop_event,
@@ -643,11 +761,12 @@ def test_post_rollover_empty_stop_tail_timeout_keeps_existing_text(monkeypatch) 
         "success",
         "empty",
     ]
-    assert transcriber.last_capture.segments[1]["source"] == "microphone-stop-tail"
+    assert transcriber.last_capture.segments[1]["source"] == "microphone-live"
+    assert transcriber.last_capture.segments[1]["break_reason"] == "stop"
     assert transcriber.last_capture.segments[1]["known_silence"] is True
 
 
-def test_post_rollover_non_silent_empty_tail_timeout_tries_recovery(monkeypatch) -> None:
+def test_post_rollover_non_silent_empty_tail_timeout_is_incomplete(monkeypatch) -> None:
     transcriber = _make_transcriber()
     transcriber.config.realtime.segment_max_seconds = 0.08
     transcriber.config.realtime.stop_tail_ms = 0
@@ -663,7 +782,6 @@ def test_post_rollover_non_silent_empty_tail_timeout_tries_recovery(monkeypatch)
     sockets = [
         FakeRealtimeWebSocket("uno dos", on_final_commit=mark_stopped_with_voiced_tail),
         NeverDoneRealtimeWebSocket(),
-        FakeRealtimeWebSocket("uno dos final recuperado"),
     ]
 
     async def fake_connect():
@@ -671,23 +789,23 @@ def test_post_rollover_non_silent_empty_tail_timeout_tries_recovery(monkeypatch)
 
     monkeypatch.setattr(transcriber, "_connect", fake_connect)
 
-    text = asyncio.run(
-        transcriber.transcribe_microphone(
-            stop_event=stop_event,
-            mic=mic,
-            close_mic=False,
+    with pytest.raises(RealtimeError, match="final stop segment returned empty transcript"):
+        asyncio.run(
+            transcriber.transcribe_microphone(
+                stop_event=stop_event,
+                mic=mic,
+                close_mic=False,
+            )
         )
-    )
 
-    assert text == "uno dos final recuperado"
     assert transcriber.last_capture is not None
-    assert transcriber.last_capture.completion_status == "complete"
-    assert transcriber.last_capture.segments[1]["source"] == "microphone-stop-tail"
-    assert transcriber.last_capture.segments[1]["status"] == "empty"
+    assert transcriber.last_capture.raw_text == "uno dos"
+    assert transcriber.last_capture.completion_status == "incomplete"
+    assert transcriber.last_capture.segments[1]["source"] == "microphone-live"
+    assert transcriber.last_capture.segments[1]["status"] == "error"
     assert transcriber.last_capture.segments[1]["known_silence"] is False
     assert transcriber.last_capture.segment_texts == [
         "uno dos",
-        "uno dos final recuperado",
     ]
 
 
@@ -872,3 +990,66 @@ def test_completion_problem_still_detects_missing_segment_past_rollover_slack() 
     problem = RealtimeTranscriber.completion_problem(capture, "texto parcial")
 
     assert "expected about 3" in problem
+
+
+def test_completion_problem_allows_stop_tail_to_cover_multiple_nominal_segments() -> None:
+    transcriber = _make_transcriber()
+    capture = transcriber._new_capture(source="microphone")
+    capture.effective_segment_max_seconds = 10.0
+    voiced_seconds = 32.02
+    silent_tail_seconds = 6.98
+    capture.append_audio_chunk(
+        (b"\x01\x00" * int(16000 * voiced_seconds))
+        + (b"\x00\x00" * int(16000 * silent_tail_seconds))
+    )
+    capture.segments.extend(
+        [
+            {
+                "index": 1,
+                "source": "microphone-live",
+                "status": "success",
+                "audio_seconds": 10.02,
+                "audio_end_seconds": 10.02,
+            },
+            {
+                "index": 2,
+                "source": "microphone-stop-tail",
+                "status": "success",
+                "audio_seconds": 22.0,
+                "audio_end_seconds": 32.02,
+            },
+        ]
+    )
+
+    problem = RealtimeTranscriber.completion_problem(capture, "texto completo")
+
+    assert problem == ""
+
+
+def test_completion_problem_keeps_non_silent_uncovered_tail_fatal() -> None:
+    transcriber = _make_transcriber()
+    capture = transcriber._new_capture(source="microphone")
+    capture.effective_segment_max_seconds = 10.0
+    capture.append_audio_chunk(b"\x01\x00" * int(16000 * 39.0))
+    capture.segments.extend(
+        [
+            {
+                "index": 1,
+                "source": "microphone-live",
+                "status": "success",
+                "audio_seconds": 10.02,
+                "audio_end_seconds": 10.02,
+            },
+            {
+                "index": 2,
+                "source": "microphone-stop-tail",
+                "status": "success",
+                "audio_seconds": 22.0,
+                "audio_end_seconds": 32.02,
+            },
+        ]
+    )
+
+    problem = RealtimeTranscriber.completion_problem(capture, "texto parcial")
+
+    assert "untranscribed trailing audio" in problem

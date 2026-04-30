@@ -4,7 +4,7 @@ import signal
 from types import SimpleNamespace
 
 from voxtray.realtime import RealtimeError, TranscriptionCapture
-from voxtray.worker import run_record_worker
+from voxtray.worker import NO_MIC_SIGNAL_MESSAGE, run_record_worker
 
 
 class DummyStateStore:
@@ -133,8 +133,9 @@ def test_run_record_worker_saves_success_artifact(monkeypatch):
             stop_event,
             mic=None,
             close_mic=True,
+            on_recording_stopped=None,
         ):
-            del stop_event
+            del stop_event, on_recording_stopped
             seen["mic"] = mic
             seen["close_mic"] = close_mic
             return " hola mundo "
@@ -199,8 +200,9 @@ def test_run_record_worker_loads_engine_before_starting_microphone(monkeypatch):
             stop_event,
             mic=None,
             close_mic=True,
+            on_recording_stopped=None,
         ):
-            del stop_event, mic, close_mic
+            del stop_event, mic, close_mic, on_recording_stopped
             events.append("transcribe")
             return "hola"
 
@@ -223,6 +225,63 @@ def test_run_record_worker_loads_engine_before_starting_microphone(monkeypatch):
 
     assert result == 0
     assert events == ["engine", "canary", "mic", "transcribe"]
+
+
+def test_run_record_worker_marks_transcribing_when_microphone_stops(monkeypatch):
+    state_store = DummyStateStore()
+    history_store = DummyHistoryStore(max_items=5)
+    artifact_store = DummyRecordingArtifactStore()
+    DummyMicrophoneStream.instances = []
+    states_after_stop: list[str] = []
+
+    capture = TranscriptionCapture(source="microphone", sample_rate=16000, chunk_ms=40)
+    capture.append_audio_chunk(b"\x01\x00" * 160)
+    capture.segment_texts.append("hola")
+
+    class StoppingTranscriber:
+        def __init__(self, config) -> None:
+            self.config = config
+            self.last_capture = capture
+
+        def check_realtime_session_blocking(self) -> None:
+            return None
+
+        def transcribe_microphone_blocking(
+            self,
+            stop_event,
+            mic=None,
+            close_mic=True,
+            on_recording_stopped=None,
+        ):
+            del mic, close_mic
+            stop_event.set()
+            assert on_recording_stopped is not None
+            on_recording_stopped()
+            states_after_stop.append(state_store.values["activity_state"])
+            return "hola"
+
+    monkeypatch.setattr("voxtray.worker.load_config", _build_config)
+    monkeypatch.setattr("voxtray.worker.StateStore", lambda: state_store)
+    monkeypatch.setattr("voxtray.worker.HistoryStore", lambda max_items: history_store)
+    monkeypatch.setattr("voxtray.worker.EngineManager", DummyEngineManager)
+    monkeypatch.setattr("voxtray.worker.RealtimeTranscriber", StoppingTranscriber)
+    monkeypatch.setattr("voxtray.worker.MicrophoneStream", DummyMicrophoneStream)
+    monkeypatch.setattr("voxtray.worker.RecordingArtifactStore", lambda: artifact_store)
+    monkeypatch.setattr("voxtray.worker.notify", lambda *args, **kwargs: None)
+    monkeypatch.setattr("voxtray.worker.copy_to_clipboard", lambda text, backend: backend)
+    monkeypatch.setattr("voxtray.worker.normalize_transcript", lambda text: text)
+    monkeypatch.setattr("voxtray.worker.signal.signal", lambda *args, **kwargs: None)
+
+    result = run_record_worker()
+
+    assert result == 0
+    assert states_after_stop == ["transcribing"]
+    assert any(
+        update.get("recording_stop_requested") is True
+        and update.get("activity_state") == "transcribing"
+        for update in state_store.updates
+    )
+    assert history_store.entries == ["hola"]
 
 
 def test_run_record_worker_skips_loading_notice_when_engine_is_ready(monkeypatch):
@@ -249,8 +308,9 @@ def test_run_record_worker_skips_loading_notice_when_engine_is_ready(monkeypatch
             stop_event,
             mic=None,
             close_mic=True,
+            on_recording_stopped=None,
         ):
-            del stop_event, mic, close_mic
+            del stop_event, mic, close_mic, on_recording_stopped
             return "hola"
 
         def check_realtime_session_blocking(self) -> None:
@@ -309,6 +369,7 @@ def test_run_record_worker_cancel_during_engine_load_skips_canary(monkeypatch):
             stop_event,
             mic=None,
             close_mic=True,
+            on_recording_stopped=None,
         ):
             raise AssertionError("microphone transcription should not start")
 
@@ -366,6 +427,7 @@ def test_run_record_worker_cancel_during_canary_skips_microphone(monkeypatch):
             stop_event,
             mic=None,
             close_mic=True,
+            on_recording_stopped=None,
         ):
             raise AssertionError("microphone transcription should not start")
 
@@ -427,8 +489,9 @@ def test_run_record_worker_marks_recording_when_reusing_mic_after_retry(monkeypa
             stop_event,
             mic=None,
             close_mic=True,
+            on_recording_stopped=None,
         ):
-            del stop_event, close_mic
+            del stop_event, close_mic, on_recording_stopped
             assert mic is DummyMicrophoneStream.instances[0]
             self.calls += 1
             states_during_transcribe.append(state_store.values["activity_state"])
@@ -477,9 +540,10 @@ def test_run_record_worker_saves_error_artifact(monkeypatch):
             stop_event,
             mic=None,
             close_mic=True,
+            on_recording_stopped=None,
         ):
             del stop_event
-            del mic, close_mic
+            del mic, close_mic, on_recording_stopped
             raise RealtimeError("backend timeout", payload={"type": "error"})
 
         def check_realtime_session_blocking(self) -> None:
@@ -507,6 +571,126 @@ def test_run_record_worker_saves_error_artifact(monkeypatch):
     assert state_store.values["last_notice_title"] == "Voxtray Error"
     assert state_store.values["last_notice_body"] == "backend timeout"
     assert state_store.values["last_notice_level"] == "error"
+    assert DummyMicrophoneStream.instances[0].stopped is True
+
+
+def test_run_record_worker_warns_when_microphone_has_no_signal(monkeypatch):
+    state_store = DummyStateStore()
+    history_store = DummyHistoryStore(max_items=5)
+    artifact_store = DummyRecordingArtifactStore()
+    DummyMicrophoneStream.instances = []
+    notices: list[tuple[str, str, str]] = []
+
+    capture = TranscriptionCapture(source="microphone", sample_rate=16000, chunk_ms=40)
+    capture.append_audio_chunk(b"\x00\x00" * 16000)
+
+    class SilentTranscriber:
+        def __init__(self, config) -> None:
+            self.config = config
+            self.last_capture = capture
+
+        def check_realtime_session_blocking(self) -> None:
+            return None
+
+        def transcribe_microphone_blocking(
+            self,
+            stop_event,
+            mic=None,
+            close_mic=True,
+            on_recording_stopped=None,
+        ):
+            del stop_event, mic, close_mic, on_recording_stopped
+            return ""
+
+    monkeypatch.setattr("voxtray.worker.load_config", _build_config)
+    monkeypatch.setattr("voxtray.worker.StateStore", lambda: state_store)
+    monkeypatch.setattr("voxtray.worker.HistoryStore", lambda max_items: history_store)
+    monkeypatch.setattr("voxtray.worker.EngineManager", DummyEngineManager)
+    monkeypatch.setattr("voxtray.worker.RealtimeTranscriber", SilentTranscriber)
+    monkeypatch.setattr("voxtray.worker.MicrophoneStream", DummyMicrophoneStream)
+    monkeypatch.setattr("voxtray.worker.RecordingArtifactStore", lambda: artifact_store)
+    monkeypatch.setattr(
+        "voxtray.worker.notify",
+        lambda title, body, urgency="normal": notices.append((title, body, urgency)),
+    )
+    monkeypatch.setattr("voxtray.worker.copy_to_clipboard", lambda text, backend: backend)
+    monkeypatch.setattr("voxtray.worker.normalize_transcript", lambda text: text)
+    monkeypatch.setattr("voxtray.worker.signal.signal", lambda *args, **kwargs: None)
+
+    result = run_record_worker()
+
+    assert result == 0
+    assert history_store.entries == []
+    assert artifact_store.saved[0]["status"] == "empty"
+    assert artifact_store.saved[0]["error"] == NO_MIC_SIGNAL_MESSAGE
+    diagnostics = artifact_store.saved[0]["diagnostics"]
+    assert diagnostics["audio_signal"]["has_signal"] is False
+    assert diagnostics["audio_signal"]["peak"] == 0
+    assert diagnostics["events"] == [
+        {
+            "event": "microphone_signal_missing",
+            "audio_signal": diagnostics["audio_signal"],
+        }
+    ]
+    assert state_store.values["last_error"] == NO_MIC_SIGNAL_MESSAGE
+    assert notices[-1] == ("Voxtray", NO_MIC_SIGNAL_MESSAGE, "normal")
+
+
+def test_run_record_worker_skips_fallback_when_microphone_has_no_signal(monkeypatch):
+    state_store = DummyStateStore()
+    history_store = DummyHistoryStore(max_items=5)
+    artifact_store = DummyRecordingArtifactStore()
+    DummyMicrophoneStream.instances = []
+
+    live_capture = TranscriptionCapture(source="microphone", sample_rate=16000, chunk_ms=40)
+    live_capture.append_audio_chunk(b"\x00\x00" * 16000)
+
+    class NoSignalFailingTranscriber:
+        instances = 0
+
+        def __init__(self, config) -> None:
+            self.config = config
+            type(self).instances += 1
+            self.last_capture = live_capture
+
+        def check_realtime_session_blocking(self) -> None:
+            return None
+
+        def transcribe_microphone_blocking(
+            self,
+            stop_event,
+            mic=None,
+            close_mic=True,
+            on_recording_stopped=None,
+        ):
+            del mic, close_mic, on_recording_stopped
+            stop_event.set()
+            raise RealtimeError("timed out waiting for transcription.done")
+
+        def transcribe_file_blocking(self, audio_path: Path):
+            raise AssertionError(f"fallback should not run for no-signal audio: {audio_path}")
+
+    monkeypatch.setattr("voxtray.worker.load_config", _build_config)
+    monkeypatch.setattr("voxtray.worker.StateStore", lambda: state_store)
+    monkeypatch.setattr("voxtray.worker.HistoryStore", lambda max_items: history_store)
+    monkeypatch.setattr("voxtray.worker.EngineManager", DummyEngineManager)
+    monkeypatch.setattr("voxtray.worker.RealtimeTranscriber", NoSignalFailingTranscriber)
+    monkeypatch.setattr("voxtray.worker.MicrophoneStream", DummyMicrophoneStream)
+    monkeypatch.setattr("voxtray.worker.RecordingArtifactStore", lambda: artifact_store)
+    monkeypatch.setattr("voxtray.worker.notify", lambda *args, **kwargs: None)
+    monkeypatch.setattr("voxtray.worker.copy_to_clipboard", lambda text, backend: backend)
+    monkeypatch.setattr("voxtray.worker.normalize_transcript", lambda text: text)
+    monkeypatch.setattr("voxtray.worker.signal.signal", lambda *args, **kwargs: None)
+
+    result = run_record_worker()
+
+    assert result == 0
+    assert NoSignalFailingTranscriber.instances == 1
+    assert history_store.entries == []
+    assert len(artifact_store.saved) == 1
+    assert artifact_store.saved[0]["status"] == "empty"
+    assert artifact_store.saved[0]["error"] == NO_MIC_SIGNAL_MESSAGE
+    assert state_store.values["last_error"] == NO_MIC_SIGNAL_MESSAGE
     assert DummyMicrophoneStream.instances[0].stopped is True
 
 
@@ -555,8 +739,9 @@ def test_run_record_worker_falls_back_to_saved_audio_after_stop_failure(monkeypa
             stop_event,
             mic=None,
             close_mic=True,
+            on_recording_stopped=None,
         ):
-            del close_mic
+            del close_mic, on_recording_stopped
             mic.queued_chunks.append(queued_tail)
             stop_event.set()
             raise RealtimeError("timed out waiting for transcription.done")
@@ -618,8 +803,9 @@ def test_run_record_worker_resaves_artifact_after_fallback_failure(monkeypatch):
             stop_event,
             mic=None,
             close_mic=True,
+            on_recording_stopped=None,
         ):
-            del mic, close_mic
+            del mic, close_mic, on_recording_stopped
             stop_event.set()
             raise RealtimeError("timed out waiting for transcription.done")
 
@@ -693,8 +879,9 @@ def test_record_worker_signal_handler_only_sets_memory_flag(monkeypatch):
             stop_event,
             mic=None,
             close_mic=True,
+            on_recording_stopped=None,
         ):
-            del mic, close_mic
+            del mic, close_mic, on_recording_stopped
             state_store.in_signal_handler = True
             handlers[signal.SIGUSR1](signal.SIGUSR1, None)
             state_store.in_signal_handler = False

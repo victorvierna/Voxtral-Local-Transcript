@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+from array import array
 import base64
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass, field
 import json
 import logging
+import math
 from pathlib import Path
 import re
 import shlex
 import subprocess
+import sys
 import threading
 
 import websockets
@@ -18,12 +22,58 @@ from .audio import MicrophoneStream
 from .config import VoxtrayConfig
 
 DeltaCallback = Callable[[str], None]
+RecordingStoppedCallback = Callable[[], None]
+PCM16_SIGNAL_MIN_DURATION_SECONDS = 0.5
+PCM16_SIGNAL_PEAK_THRESHOLD = 16
+PCM16_SIGNAL_RMS_THRESHOLD = 1.0
 
 
 class RealtimeError(RuntimeError):
     def __init__(self, message: str, payload: object | None = None) -> None:
         super().__init__(message)
         self.payload = payload
+
+
+def pcm16_signal_stats(raw_audio: bytes, sample_rate: int) -> dict[str, object]:
+    even_length = len(raw_audio) - (len(raw_audio) % 2)
+    if even_length <= 0:
+        return {
+            "duration_seconds": 0.0,
+            "sample_count": 0,
+            "peak": 0,
+            "rms": 0.0,
+            "has_signal": False,
+        }
+
+    samples = array("h")
+    samples.frombytes(raw_audio[:even_length])
+    if sys.byteorder != "little":
+        samples.byteswap()
+
+    peak = 0
+    sum_squares = 0
+    nonzero_samples = 0
+    for sample in samples:
+        value = abs(sample)
+        if value:
+            nonzero_samples += 1
+        if value > peak:
+            peak = value
+        sum_squares += sample * sample
+
+    sample_count = len(samples)
+    rms = math.sqrt(sum_squares / sample_count) if sample_count else 0.0
+    duration_seconds = sample_count / float(sample_rate) if sample_rate > 0 else 0.0
+    has_signal = peak >= PCM16_SIGNAL_PEAK_THRESHOLD or rms >= PCM16_SIGNAL_RMS_THRESHOLD
+
+    return {
+        "duration_seconds": round(duration_seconds, 3),
+        "sample_count": sample_count,
+        "nonzero_samples": nonzero_samples,
+        "peak": peak,
+        "rms": round(rms, 3),
+        "has_signal": has_signal,
+    }
 
 
 @dataclass(slots=True)
@@ -57,15 +107,37 @@ class TranscriptionCapture:
             return 0.0
         return len(self.pcm16_audio) / float(self.sample_rate * 2)
 
+    def audio_signal_stats(self) -> dict[str, object]:
+        return pcm16_signal_stats(self.audio_bytes(), self.sample_rate)
+
+    def lacks_input_signal(
+        self,
+        min_duration_seconds: float = PCM16_SIGNAL_MIN_DURATION_SECONDS,
+    ) -> bool:
+        stats = self.audio_signal_stats()
+        duration_seconds = float(stats.get("duration_seconds", 0.0) or 0.0)
+        return duration_seconds >= min_duration_seconds and not bool(
+            stats.get("has_signal")
+        )
+
     def diagnostics(self) -> dict[str, object]:
         return {
             "completion_status": self.completion_status,
             "completion_reason": self.completion_reason,
             "fallback_used": self.fallback_used,
             "fallback_source": self.fallback_source,
+            "audio_signal": self.audio_signal_stats(),
             "segments": self.segments,
             "events": self.events,
         }
+
+
+@dataclass(slots=True)
+class _RealtimeReceiveState:
+    deltas: list[str] = field(default_factory=list)
+    done_seen: bool = False
+    final_text: str | None = None
+    error: RealtimeError | None = None
 
 
 class RealtimeTranscriber:
@@ -204,18 +276,25 @@ class RealtimeTranscriber:
         return None
 
     def _safe_segment_max_seconds(self) -> float | None:
-        raw_max_model_len = self._engine_arg_value("--max-model-len")
-        if not raw_max_model_len:
+        token_budgets: list[int] = []
+        for flag in ("--max-model-len", "--max-num-batched-tokens"):
+            raw_value = self._engine_arg_value(flag)
+            if not raw_value:
+                continue
+            try:
+                value = int(raw_value)
+            except ValueError:
+                continue
+            if value > 0:
+                token_budgets.append(value)
+        if not token_budgets:
             return None
-        try:
-            max_model_len = int(raw_max_model_len)
-        except ValueError:
-            return None
-        if max_model_len <= 0:
-            return None
-        # Voxtral realtime consumes roughly one audio token per 20ms. Keep
-        # headroom to avoid saturating KV cache on long recordings.
-        return max(5.0, max_model_len * 0.02 * 0.8)
+        token_budget = min(token_budgets)
+        # Voxtral realtime maps one text token to roughly 80ms of audio. Keep
+        # conservative headroom for both the sequence window and vLLM's
+        # batched-token cap; local benchmarks showed the batched-token cap is
+        # the practical limit for stable long live sessions.
+        return max(5.0, token_budget * 0.08 * 0.6)
 
     def _effective_segment_max_seconds(self, requested_seconds: float) -> float:
         safe_seconds = self._safe_segment_max_seconds()
@@ -226,17 +305,21 @@ class RealtimeTranscriber:
         return min(requested_seconds, safe_seconds)
 
     @staticmethod
-    def _live_finalize_wait_seconds(
+    def _stream_finalize_wait_seconds(
         *,
         audio_seconds: float,
         configured_seconds: float,
         final_segment: bool,
     ) -> float:
         base = max(0.5, configured_seconds)
-        dynamic = 8.0 + (max(0.0, audio_seconds) * 1.5)
-        if final_segment:
-            dynamic += 6.0
-        return max(base, min(75.0, dynamic))
+        if final_segment and audio_seconds >= 1.0:
+            base = max(base, 16.0)
+        if audio_seconds <= 0:
+            return base
+        multiplier = 1.0
+        cap = 75.0 if final_segment else 45.0
+        dynamic = 4.0 + (audio_seconds * multiplier)
+        return max(base, min(cap, dynamic))
 
     @staticmethod
     def _format_error_message(msg: dict[str, object]) -> str:
@@ -315,6 +398,110 @@ class RealtimeTranscriber:
 
         return False, None
 
+    async def _receive_stream_events(
+        self,
+        ws,
+        state: _RealtimeReceiveState,
+        on_delta: DeltaCallback | None,
+        capture: TranscriptionCapture | None = None,
+    ) -> None:
+        while True:
+            try:
+                raw = await ws.recv()
+                msg = json.loads(raw)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                message = f"realtime websocket receive failed: {exc}"
+                state.error = RealtimeError(message)
+                if capture is not None:
+                    capture.error_message = message
+                return
+
+            msg_type = msg.get("type")
+            if msg_type == "transcription.delta":
+                delta = msg.get("delta", "")
+                if delta:
+                    state.deltas.append(delta)
+                    if on_delta:
+                        on_delta(delta)
+                continue
+
+            if msg_type == "transcription.done":
+                text = msg.get("text")
+                state.done_seen = True
+                state.final_text = text if text is not None else "".join(state.deltas)
+                return
+
+            if msg_type == "error":
+                message = self._format_error_message(msg)
+                if capture is not None:
+                    capture.error_message = message
+                    capture.error_payload = msg
+                state.error = RealtimeError(message, payload=msg)
+                return
+
+    @staticmethod
+    async def _cancel_receive_task(task: asyncio.Task[None] | None) -> None:
+        if task is None or task.done():
+            return
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+    async def _collect_stream_done_text(
+        self,
+        receive_task: asyncio.Task[None],
+        state: _RealtimeReceiveState,
+        timeout_seconds: float,
+        capture: TranscriptionCapture | None = None,
+        allow_empty_timeout: bool = False,
+    ) -> str | None:
+        if timeout_seconds <= 0:
+            return None
+
+        if state.error is not None:
+            raise state.error
+        if not state.done_seen:
+            try:
+                await asyncio.wait_for(asyncio.shield(receive_task), timeout_seconds)
+            except asyncio.TimeoutError:
+                pass
+
+        if state.error is not None:
+            raise state.error
+        if state.done_seen:
+            return (
+                state.final_text
+                if state.final_text is not None
+                else "".join(state.deltas)
+            )
+
+        if not state.deltas:
+            if allow_empty_timeout:
+                self.logger.warning(
+                    "timed out waiting for transcription.done after %.1fs; treating as empty segment",
+                    timeout_seconds,
+                )
+                return ""
+            message = (
+                f"timed out waiting for transcription.done after {timeout_seconds:.1f}s"
+            )
+            if capture is not None:
+                capture.error_message = message
+            raise RealtimeError(message)
+
+        partial_text = "".join(state.deltas).strip()
+        message = (
+            f"timed out waiting for transcription.done after {timeout_seconds:.1f}s"
+            " after receiving partial transcript"
+        )
+        if partial_text:
+            message = f"{message}: {partial_text}"
+        if capture is not None:
+            capture.error_message = message
+        raise RealtimeError(message)
+
     async def _append_audio_chunk(self, ws, chunk: bytes) -> None:
         await ws.send(
             json.dumps(
@@ -338,6 +525,13 @@ class RealtimeTranscriber:
         if capture is None or not chunk:
             return
         capture.append_audio_chunk(chunk)
+
+    @staticmethod
+    async def _get_microphone_chunk(
+        mic: MicrophoneStream,
+        timeout: float = 0.05,
+    ) -> bytes | None:
+        return mic.get_chunk(timeout=timeout)
 
     async def _append_chunk_and_maybe_start_generation(
         self,
@@ -369,7 +563,7 @@ class RealtimeTranscriber:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + (grace_ms / 1000.0)
         while loop.time() < deadline:
-            chunk = mic.get_chunk(timeout=0.02)
+            chunk = await self._get_microphone_chunk(mic, timeout=0.02)
             if not chunk:
                 continue
             self._record_audio_chunk(capture, chunk)
@@ -436,12 +630,10 @@ class RealtimeTranscriber:
             capture.error_message = message
         raise RealtimeError(message)
 
-    async def _flush_stop_tail(
+    async def _flush_stop_tail_streaming(
         self,
         ws,
         mic: MicrophoneStream,
-        deltas: list[str],
-        on_delta: DeltaCallback | None,
         tail_ms: int,
         generation_started: bool,
         capture: TranscriptionCapture | None = None,
@@ -456,7 +648,7 @@ class RealtimeTranscriber:
         quiet_deadline = loop.time() + (tail_ms / 1000.0)
         appended = 0
         while loop.time() < hard_deadline:
-            chunk = mic.get_chunk(timeout=0.02)
+            chunk = await self._get_microphone_chunk(mic, timeout=0.02)
             if chunk:
                 self._record_audio_chunk(capture, chunk)
                 generation_started = await self._append_chunk_and_maybe_start_generation(
@@ -470,14 +662,6 @@ class RealtimeTranscriber:
                     loop.time() + (idle_extension_ms / 1000.0),
                 )
 
-            await self._recv_once(
-                ws,
-                deltas,
-                on_delta,
-                timeout=0.002,
-                accept_done=False,
-                capture=capture,
-            )
             if loop.time() >= quiet_deadline:
                 break
         return appended, generation_started
@@ -496,15 +680,6 @@ class RealtimeTranscriber:
             raw_audio[offset : offset + segment_bytes]
             for offset in range(0, len(raw_audio), segment_bytes)
         ]
-
-    def _tail_pcm16_audio(self, raw_audio: bytes, seconds: float) -> bytes:
-        if not raw_audio or seconds <= 0:
-            return b""
-        bytes_per_second = max(1, self._audio_sample_rate() * 2)
-        tail_bytes = max(2, int(seconds * bytes_per_second))
-        if tail_bytes % 2 != 0:
-            tail_bytes -= 1
-        return raw_audio[-tail_bytes:]
 
     @staticmethod
     def _normalized_words(text: str) -> list[str]:
@@ -572,31 +747,63 @@ class RealtimeTranscriber:
                 (adjusted_duration_seconds + effective_seconds - 0.001)
                 // effective_seconds
             )
-            if len(capture.segments) < expected_segments:
+            covered_segments = 0
+            covered_audio_end_seconds = 0.0
+            has_segment_audio_end = False
+            for segment in capture.segments:
+                segment_audio_seconds = segment.get("audio_seconds")
+                try:
+                    audio_seconds = float(segment_audio_seconds)
+                except (TypeError, ValueError):
+                    audio_seconds = 0.0
+                if audio_seconds > 0:
+                    adjusted_audio_seconds = max(
+                        0.0,
+                        audio_seconds - rollover_slack_seconds,
+                    )
+                    covered_segments += max(
+                        1,
+                        int(
+                            (adjusted_audio_seconds + effective_seconds - 0.001)
+                            // effective_seconds
+                        ),
+                    )
+                else:
+                    covered_segments += 1
+
+                segment_audio_end = segment.get("audio_end_seconds")
+                try:
+                    audio_end_seconds = float(segment_audio_end)
+                except (TypeError, ValueError):
+                    audio_end_seconds = 0.0
+                has_segment_audio_end = has_segment_audio_end or audio_end_seconds > 0.0
+                covered_audio_end_seconds = max(
+                    covered_audio_end_seconds,
+                    audio_end_seconds,
+                )
+
+            if covered_segments < expected_segments:
                 return (
                     "transcription incomplete: "
                     f"expected about {expected_segments} segment(s), got {len(capture.segments)}"
                 )
 
-        return ""
+            if (
+                has_segment_audio_end
+                and covered_audio_end_seconds + rollover_slack_seconds < duration_seconds
+            ):
+                bytes_per_second = max(1, capture.sample_rate * 2)
+                uncovered_start = int(covered_audio_end_seconds * bytes_per_second)
+                uncovered_start -= uncovered_start % 2
+                if not RealtimeTranscriber._pcm16_is_known_silence(
+                    capture.audio_bytes()[uncovered_start:]
+                ):
+                    return (
+                        "transcription incomplete: "
+                        f"untranscribed trailing audio after {covered_audio_end_seconds:.2f}s"
+                    )
 
-    @staticmethod
-    def _should_recover_empty_stop_tail(
-        capture: TranscriptionCapture,
-        *,
-        tail_chunks: int,
-        has_existing_text: bool,
-    ) -> bool:
-        if tail_chunks <= 0 or not has_existing_text:
-            return False
-        if not capture.segments:
-            return True
-        tail_segment = capture.segments[-1]
-        return not (
-            tail_segment.get("source") == "microphone-stop-tail"
-            and tail_segment.get("status") == "empty"
-            and tail_segment.get("known_silence") is True
-        )
+        return ""
 
     async def _transcribe_pcm16_audio(
         self,
@@ -695,162 +902,6 @@ class RealtimeTranscriber:
             raise last_error
         raise RealtimeError("segment retry failed without error detail")
 
-    async def _recover_final_tail_text(
-        self,
-        capture: TranscriptionCapture,
-        existing_text: str,
-        *,
-        seconds: float = 8.0,
-    ) -> tuple[str, str]:
-        tail_audio = self._tail_pcm16_audio(capture.audio_bytes(), seconds=seconds)
-        if not tail_audio:
-            return existing_text, ""
-
-        tail_seconds = len(tail_audio) / max(1, self._audio_sample_rate() * 2)
-        timeout_seconds = max(15.0, tail_seconds + 10.0)
-        try:
-            tail_text = await self._transcribe_pcm16_audio(
-                tail_audio,
-                timeout_seconds=timeout_seconds,
-            )
-        except RealtimeError as exc:
-            self.logger.warning("final tail recovery failed: %s", exc)
-            return existing_text, ""
-
-        merged_text = self._merge_tail_text(existing_text, tail_text)
-        if merged_text != existing_text:
-            self.logger.info(
-                "recovered final tail using %.1fs context: %s",
-                tail_seconds,
-                tail_text,
-            )
-        return merged_text, tail_text
-
-    async def _transcribe_queued_stop_tail(
-        self,
-        mic: MicrophoneStream,
-        capture: TranscriptionCapture,
-        on_delta: DeltaCallback | None,
-        *,
-        stop_tail_ms: int,
-        final_timeout_seconds: float,
-    ) -> tuple[str, int]:
-        """Transcribe audio queued after a segment rollover but before stop."""
-        deltas: list[str] = []
-        final_text: str | None = None
-        sent_audio_chunks = 0
-        generation_started = False
-        segment_start_seconds = capture.audio_duration_seconds()
-        segment_start_bytes = len(capture.pcm16_audio)
-
-        async with await self._connect() as ws:
-            await self._init_session(ws)
-
-            queued_chunks = mic.drain()
-            for chunk in queued_chunks:
-                self._record_audio_chunk(capture, chunk)
-                generation_started = await self._append_chunk_and_maybe_start_generation(
-                    ws,
-                    chunk,
-                    generation_started,
-                )
-                sent_audio_chunks += 1
-                await self._recv_once(
-                    ws,
-                    deltas,
-                    on_delta,
-                    timeout=0.002,
-                    accept_done=False,
-                    capture=capture,
-                )
-
-            tail_appended, generation_started = await self._flush_stop_tail(
-                ws,
-                mic,
-                deltas,
-                on_delta,
-                tail_ms=stop_tail_ms,
-                generation_started=generation_started,
-                capture=capture,
-            )
-            sent_audio_chunks += tail_appended
-
-            tail_chunks = mic.drain()
-            for chunk in tail_chunks:
-                self._record_audio_chunk(capture, chunk)
-                generation_started = await self._append_chunk_and_maybe_start_generation(
-                    ws,
-                    chunk,
-                    generation_started,
-                )
-                sent_audio_chunks += 1
-                await self._recv_once(
-                    ws,
-                    deltas,
-                    on_delta,
-                    timeout=0.002,
-                    accept_done=False,
-                    capture=capture,
-                )
-
-            if sent_audio_chunks == 0 or not generation_started:
-                return "", sent_audio_chunks
-
-            await ws.send(json.dumps({"type": "input_audio_buffer.commit", "final": True}))
-
-            audio_seconds = sent_audio_chunks * self._audio_chunk_seconds()
-            wait_seconds = self._live_finalize_wait_seconds(
-                audio_seconds=audio_seconds,
-                configured_seconds=final_timeout_seconds,
-                final_segment=True,
-            )
-            segment_audio = capture.audio_bytes()[segment_start_bytes:]
-            segment_record = self._new_segment_record(
-                capture,
-                source="microphone-stop-tail",
-                audio_start_seconds=segment_start_seconds,
-                audio_seconds=self._audio_seconds_for_bytes(segment_audio),
-                chunk_count=sent_audio_chunks,
-                break_reason="stop_tail",
-                final_segment=True,
-                wait_seconds=wait_seconds,
-            )
-            try:
-                final_text = await self._collect_done_text(
-                    ws,
-                    deltas,
-                    on_delta,
-                    timeout_seconds=wait_seconds,
-                    capture=capture,
-                    allow_empty_timeout=True,
-                )
-            except RealtimeError as exc:
-                segment_record["status"] = "error"
-                segment_record["error"] = str(exc)
-                self._record_segment_attempt(
-                    segment_record,
-                    attempt=1,
-                    status="error",
-                    timeout_seconds=wait_seconds,
-                    error=str(exc),
-                    payload=exc.payload,
-                )
-                raise
-
-            tail_text = (final_text or "".join(deltas)).strip()
-            segment_record["known_silence"] = self._pcm16_is_known_silence(segment_audio)
-            segment_record["status"] = "success" if tail_text else "empty"
-            segment_record["text_chars"] = len(tail_text)
-            self._record_segment_attempt(
-                segment_record,
-                attempt=1,
-                status=str(segment_record["status"]),
-                timeout_seconds=wait_seconds,
-                text=tail_text,
-            )
-
-        return tail_text, sent_audio_chunks
-
     async def transcribe_microphone(
         self,
         stop_event: threading.Event,
@@ -858,6 +909,7 @@ class RealtimeTranscriber:
         final_timeout_seconds: float | None = None,
         mic: MicrophoneStream | None = None,
         close_mic: bool = True,
+        on_recording_stopped: RecordingStoppedCallback | None = None,
     ) -> str:
         final_timeout = (
             final_timeout_seconds
@@ -877,6 +929,9 @@ class RealtimeTranscriber:
         capture = self._new_capture(source="microphone")
         capture.requested_segment_max_seconds = requested_segment_max_seconds
         capture.effective_segment_max_seconds = segment_max_seconds
+        mic_stopped = False
+        recording_stopped_notified = False
+
         if mic is None:
             mic = MicrophoneStream(
                 sample_rate=self.config.audio.sample_rate,
@@ -885,241 +940,257 @@ class RealtimeTranscriber:
                 max_queue_chunks=self.config.realtime.mic_queue_chunks,
             )
         mic.start()
+
+        def notify_recording_stopped() -> None:
+            nonlocal recording_stopped_notified
+            if recording_stopped_notified:
+                return
+            recording_stopped_notified = True
+            if on_recording_stopped is not None:
+                on_recording_stopped()
+
+        def stop_microphone_for_user_stop() -> None:
+            nonlocal mic_stopped
+            if not mic_stopped:
+                mic.stop()
+                mic_stopped = True
+            notify_recording_stopped()
+
         try:
             while True:
-                deltas: list[str] = []
+                receive_state = _RealtimeReceiveState()
+                receive_task: asyncio.Task[None] | None = None
                 final_text: str | None = None
                 sent_audio_chunks = 0
                 generation_started = False
                 segment_break_reason = ""
                 segment_start_seconds = capture.audio_duration_seconds()
                 segment_start_bytes = len(capture.pcm16_audio)
+                segment_record: dict[str, object] | None = None
 
                 async with await self._connect() as ws:
                     await self._init_session(ws)
-
-                    while True:
-                        chunk = mic.get_chunk(timeout=0.05)
-                        if chunk:
-                            self._record_audio_chunk(capture, chunk)
-                            generation_started = await self._append_chunk_and_maybe_start_generation(
-                                ws,
-                                chunk,
-                                generation_started,
-                            )
-                            sent_audio_chunks += 1
-
-                        await self._recv_once(
+                    receive_task = asyncio.create_task(
+                        self._receive_stream_events(
                             ws,
-                            deltas,
+                            receive_state,
                             on_delta,
-                            timeout=0.005,
-                            accept_done=False,
                             capture=capture,
                         )
+                    )
+                    try:
+                        while True:
+                            if receive_state.error is not None:
+                                raise receive_state.error
+                            if receive_state.done_seen and not stop_event.is_set():
+                                raise RealtimeError(
+                                    "realtime transcription ended before final commit"
+                                )
 
-                        if stop_event.is_set():
-                            if sent_audio_chunks == 0:
-                                captured, generation_started = await self._capture_initial_chunk_before_commit(
+                            chunk = await self._get_microphone_chunk(mic, timeout=0.02)
+                            if chunk:
+                                self._record_audio_chunk(capture, chunk)
+                                generation_started = await self._append_chunk_and_maybe_start_generation(
+                                    ws,
+                                    chunk,
+                                    generation_started,
+                                )
+                                sent_audio_chunks += 1
+
+                            if stop_event.is_set():
+                                if sent_audio_chunks == 0:
+                                    captured, generation_started = await self._capture_initial_chunk_before_commit(
+                                        ws,
+                                        mic,
+                                        grace_ms=first_chunk_grace_ms,
+                                        generation_started=generation_started,
+                                        capture=capture,
+                                    )
+                                    sent_audio_chunks += captured
+                                tail_appended, generation_started = await self._flush_stop_tail_streaming(
                                     ws,
                                     mic,
-                                    grace_ms=first_chunk_grace_ms,
+                                    tail_ms=stop_tail_ms,
                                     generation_started=generation_started,
                                     capture=capture,
                                 )
-                                sent_audio_chunks += captured
-                            # Capture a short tail to avoid dropping the last syllable/word.
-                            tail_appended, generation_started = await self._flush_stop_tail(
-                                ws,
-                                mic,
-                                deltas,
-                                on_delta,
-                                tail_ms=stop_tail_ms,
-                                generation_started=generation_started,
-                                capture=capture,
+                                sent_audio_chunks += tail_appended
+                                stop_microphone_for_user_stop()
+                                tail_chunks = mic.drain()
+                                if tail_chunks:
+                                    sent_audio_chunks += len(tail_chunks)
+                                    for tail_chunk in tail_chunks:
+                                        self._record_audio_chunk(capture, tail_chunk)
+                                        generation_started = await self._append_chunk_and_maybe_start_generation(
+                                            ws,
+                                            tail_chunk,
+                                            generation_started,
+                                        )
+                                segment_break_reason = "stop"
+                                break
+
+                            segment_audio_seconds = (
+                                sent_audio_chunks * self._audio_chunk_seconds()
                             )
-                            sent_audio_chunks += tail_appended
-                            # Flush any remaining tail audio captured right before stop.
-                            tail_chunks = mic.drain()
-                            if tail_chunks:
-                                sent_audio_chunks += len(tail_chunks)
-                                for index, tail_chunk in enumerate(tail_chunks):
-                                    self._record_audio_chunk(capture, tail_chunk)
-                                    generation_started = await self._append_chunk_and_maybe_start_generation(
-                                        ws,
-                                        tail_chunk,
-                                        generation_started if index > 0 else generation_started,
-                                    )
-                            segment_break_reason = "stop"
-                            break
-
-                        segment_audio_seconds = sent_audio_chunks * self._audio_chunk_seconds()
-                        if (
-                            generation_started
-                            and segment_max_seconds > 0
-                            and segment_audio_seconds >= segment_max_seconds
-                        ):
-                            self.logger.debug(
-                                "segment rollover after %.1fs of audio (effective max %.1fs, requested %.1fs)",
-                                segment_audio_seconds,
-                                segment_max_seconds,
-                                requested_segment_max_seconds,
-                            )
-                            segment_break_reason = "rollover"
-                            break
-
-                    if sent_audio_chunks == 0 or not generation_started:
-                        self.logger.debug(
-                            "skipping commit for empty segment (no captured audio)"
-                        )
-                        if stop_event.is_set():
-                            break
-                        continue
-
-                    await ws.send(json.dumps({"type": "input_audio_buffer.commit", "final": True}))
-
-                    segment_audio_seconds = sent_audio_chunks * self._audio_chunk_seconds()
-                    wait_seconds = self._live_finalize_wait_seconds(
-                        audio_seconds=segment_audio_seconds,
-                        configured_seconds=(
-                            final_timeout
-                            if stop_event.is_set()
-                            else segment_finalize_timeout
-                        ),
-                        final_segment=stop_event.is_set(),
-                    )
-                    allow_empty_timeout = bool(stop_event.is_set()) and (
-                        segment_audio_seconds < 1.0
-                    )
-                    segment_audio = capture.audio_bytes()[segment_start_bytes:]
-                    segment_record = self._new_segment_record(
-                        capture,
-                        source="microphone-live",
-                        audio_start_seconds=segment_start_seconds,
-                        audio_seconds=self._audio_seconds_for_bytes(segment_audio),
-                        chunk_count=sent_audio_chunks,
-                        break_reason=segment_break_reason,
-                        final_segment=stop_event.is_set(),
-                        wait_seconds=wait_seconds,
-                    )
-                    try:
-                        final_text = await self._collect_done_text(
-                            ws,
-                            deltas,
-                            on_delta,
-                            timeout_seconds=wait_seconds,
-                            capture=capture,
-                            allow_empty_timeout=allow_empty_timeout,
-                        )
-                    except RealtimeError as exc:
-                        segment_record["status"] = "error"
-                        segment_record["error"] = str(exc)
-                        self._record_segment_attempt(
-                            segment_record,
-                            attempt=1,
-                            status="error",
-                            timeout_seconds=wait_seconds,
-                            error=str(exc),
-                            payload=exc.payload,
-                        )
-                        if not segment_audio:
-                            raise
-                        final_text = await self._retry_segment_audio(
-                            segment_audio,
-                            timeout_seconds=wait_seconds,
-                            segment=segment_record,
-                            on_delta=on_delta,
-                            allow_empty_retry=(
-                                allow_empty_timeout
-                                and not deltas
-                                and str(exc).startswith(
-                                    "timed out waiting for transcription.done"
+                            if (
+                                generation_started
+                                and segment_max_seconds > 0
+                                and segment_audio_seconds >= segment_max_seconds
+                            ):
+                                self.logger.debug(
+                                    "segment rollover after %.1fs of audio (effective max %.1fs, requested %.1fs)",
+                                    segment_audio_seconds,
+                                    segment_max_seconds,
+                                    requested_segment_max_seconds,
                                 )
-                            ),
-                        )
-                        deltas = []
-                    else:
-                        segment_text_for_diagnostic = (final_text or "".join(deltas)).strip()
-                        segment_record["status"] = (
-                            "success" if segment_text_for_diagnostic else "empty"
-                        )
-                        segment_record["text_chars"] = len(segment_text_for_diagnostic)
-                        self._record_segment_attempt(
-                            segment_record,
-                            attempt=1,
-                            status=str(segment_record["status"]),
-                            timeout_seconds=wait_seconds,
-                            text=segment_text_for_diagnostic,
+                                segment_break_reason = "rollover"
+                                break
+
+                        if sent_audio_chunks == 0 or not generation_started:
+                            self.logger.debug(
+                                "skipping commit for empty segment (no captured audio)"
+                            )
+                            if stop_event.is_set():
+                                stop_microphone_for_user_stop()
+                                break
+                            continue
+
+                        if stop_event.is_set() and capture.lacks_input_signal():
+                            self.logger.warning(
+                                "captured microphone audio has no signal; skipping final commit"
+                            )
+                            self._record_event(
+                                capture,
+                                "microphone_signal_missing",
+                                audio_signal=capture.audio_signal_stats(),
+                            )
+                            break
+
+                        await ws.send(
+                            json.dumps(
+                                {"type": "input_audio_buffer.commit", "final": True}
+                            )
                         )
 
-                segment_text = (final_text or "".join(deltas)).strip()
-                if segment_text:
-                    all_segments.append(segment_text)
-                    capture.segment_texts.append(segment_text)
-                    if stop_event.is_set() and segment_break_reason == "stop":
-                        existing_text = "\n".join(all_segments)
-                        recovery_seconds = min(
-                            20.0,
-                            max(8.0, sent_audio_chunks * self._audio_chunk_seconds()),
+                        segment_audio_seconds = (
+                            sent_audio_chunks * self._audio_chunk_seconds()
                         )
-                        recovered_text, tail_text = await self._recover_final_tail_text(
+                        wait_seconds = self._stream_finalize_wait_seconds(
+                            audio_seconds=segment_audio_seconds,
+                            configured_seconds=(
+                                final_timeout
+                                if stop_event.is_set()
+                                else segment_finalize_timeout
+                            ),
+                            final_segment=stop_event.is_set(),
+                        )
+                        allow_empty_timeout = bool(stop_event.is_set()) and (
+                            segment_audio_seconds < 1.0
+                        )
+                        segment_audio = capture.audio_bytes()[segment_start_bytes:]
+                        segment_record = self._new_segment_record(
                             capture,
-                            existing_text,
-                            seconds=recovery_seconds,
+                            source="microphone-live",
+                            audio_start_seconds=segment_start_seconds,
+                            audio_seconds=self._audio_seconds_for_bytes(segment_audio),
+                            chunk_count=sent_audio_chunks,
+                            break_reason=segment_break_reason,
+                            final_segment=stop_event.is_set(),
+                            wait_seconds=wait_seconds,
                         )
-                        if recovered_text != existing_text:
-                            all_segments = [recovered_text]
-                            capture.segment_texts.append(tail_text)
-                elif stop_event.is_set() and sent_audio_chunks > 0 and all_segments:
-                    existing_text = "\n".join(all_segments)
-                    recovered_text, tail_text = await self._recover_final_tail_text(
-                        capture,
-                        existing_text,
+                        try:
+                            final_text = await self._collect_stream_done_text(
+                                receive_task,
+                                receive_state,
+                                timeout_seconds=wait_seconds,
+                                capture=capture,
+                                allow_empty_timeout=allow_empty_timeout,
+                            )
+                        except RealtimeError as exc:
+                            segment_record["status"] = "error"
+                            segment_record["error"] = str(exc)
+                            self._record_segment_attempt(
+                                segment_record,
+                                attempt=1,
+                                status="error",
+                                timeout_seconds=wait_seconds,
+                                error=str(exc),
+                                payload=exc.payload,
+                            )
+                            if not segment_audio:
+                                raise
+                            if (
+                                stop_event.is_set()
+                                and segment_break_reason == "stop"
+                                and exc.payload is not None
+                            ):
+                                raise
+                            final_text = await self._retry_segment_audio(
+                                segment_audio,
+                                timeout_seconds=wait_seconds,
+                                segment=segment_record,
+                                on_delta=on_delta,
+                                allow_empty_retry=(
+                                    allow_empty_timeout
+                                    and not receive_state.deltas
+                                    and str(exc).startswith(
+                                        "timed out waiting for transcription.done"
+                                    )
+                                ),
+                            )
+                            receive_state.deltas = []
+                        else:
+                            segment_text_for_diagnostic = (
+                                final_text or "".join(receive_state.deltas)
+                            ).strip()
+                            segment_record["known_silence"] = self._pcm16_is_known_silence(
+                                segment_audio
+                            )
+                            segment_record["status"] = (
+                                "success" if segment_text_for_diagnostic else "empty"
+                            )
+                            segment_record["text_chars"] = len(
+                                segment_text_for_diagnostic
+                            )
+                            self._record_segment_attempt(
+                                segment_record,
+                                attempt=1,
+                                status=str(segment_record["status"]),
+                                timeout_seconds=wait_seconds,
+                                text=segment_text_for_diagnostic,
+                            )
+                    finally:
+                        await self._cancel_receive_task(receive_task)
+
+                segment_text = (final_text or "".join(receive_state.deltas)).strip()
+                if segment_text:
+                    if all_segments:
+                        all_segments = [
+                            self._merge_tail_text(
+                                "\n".join(all_segments),
+                                segment_text,
+                            )
+                        ]
+                    else:
+                        all_segments.append(segment_text)
+                    capture.segment_texts.append(segment_text)
+                elif (
+                    stop_event.is_set()
+                    and sent_audio_chunks > 0
+                    and all_segments
+                    and segment_record is not None
+                    and segment_record.get("known_silence") is not True
+                ):
+                    completion_failed_error = (
+                        "final stop segment returned empty transcript"
                     )
-                    if recovered_text != existing_text:
-                        all_segments = [recovered_text]
-                        capture.segment_texts.append(tail_text)
+                    segment_record["status"] = "error"
+                    segment_record["error"] = completion_failed_error
+                    capture.error_message = completion_failed_error
 
                 if stop_event.is_set():
                     if segment_break_reason == "rollover":
-                        existing_text = "\n".join(all_segments)
-                        try:
-                            tail_text, tail_chunks = await self._transcribe_queued_stop_tail(
-                                mic,
-                                capture,
-                                on_delta,
-                                stop_tail_ms=stop_tail_ms,
-                                final_timeout_seconds=final_timeout,
-                            )
-                        except RealtimeError as exc:
-                            self.logger.warning(
-                                "post-rollover stop tail transcription failed: %s",
-                                exc,
-                            )
-                            completion_failed_error = str(exc)
-                            tail_text = ""
-                            tail_chunks = 0
-                        if tail_text:
-                            merged_text = self._merge_tail_text(existing_text, tail_text)
-                            if merged_text != existing_text:
-                                self.logger.info(
-                                    "recovered post-rollover stop tail: %s",
-                                    tail_text,
-                                )
-                                all_segments = [merged_text]
-                            capture.segment_texts.append(tail_text)
-                        elif self._should_recover_empty_stop_tail(
-                            capture,
-                            tail_chunks=tail_chunks,
-                            has_existing_text=bool(all_segments),
-                        ):
-                            recovered_text, recovered_tail = await self._recover_final_tail_text(
-                                capture,
-                                existing_text,
-                            )
-                            if recovered_text != existing_text:
-                                all_segments = [recovered_text]
-                                capture.segment_texts.append(recovered_tail)
+                        continue
                     break
 
             final_text_value = "\n".join(all_segments)
@@ -1155,7 +1226,7 @@ class RealtimeTranscriber:
                 capture.error_payload = exc.payload
             raise
         finally:
-            if close_mic:
+            if close_mic and not mic_stopped:
                 mic.stop()
 
     def transcribe_microphone_blocking(
@@ -1165,6 +1236,7 @@ class RealtimeTranscriber:
         final_timeout_seconds: float | None = None,
         mic: MicrophoneStream | None = None,
         close_mic: bool = True,
+        on_recording_stopped: RecordingStoppedCallback | None = None,
     ) -> str:
         return asyncio.run(
             self.transcribe_microphone(
@@ -1173,6 +1245,7 @@ class RealtimeTranscriber:
                 final_timeout_seconds=final_timeout_seconds,
                 mic=mic,
                 close_mic=close_mic,
+                on_recording_stopped=on_recording_stopped,
             )
         )
 
