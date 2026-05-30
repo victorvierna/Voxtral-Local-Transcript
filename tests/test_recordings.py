@@ -9,6 +9,8 @@ def test_recording_artifact_store_saves_audio_and_metadata(tmp_path):
     saved = store.save(
         source="microphone",
         model_id="mistralai/Voxtral-Mini-4B-Realtime-2602",
+        provider_id="local_voxtral",
+        provider_model="mistralai/Voxtral-Mini-4B-Realtime-2602",
         sample_rate=16000,
         chunk_ms=40,
         pcm16_audio=b"\x01\x00" * 1600,
@@ -28,6 +30,8 @@ def test_recording_artifact_store_saves_audio_and_metadata(tmp_path):
 
     metadata = json.loads(saved.metadata_path.read_text(encoding="utf-8"))
     assert metadata["status"] == "success"
+    assert metadata["provider_id"] == "local_voxtral"
+    assert metadata["provider_model"] == "mistralai/Voxtral-Mini-4B-Realtime-2602"
     assert metadata["raw_text"] == "hola mundo"
     assert metadata["normalized_text"] == "Hola mundo."
     assert metadata["audio_duration_seconds"] == 0.1

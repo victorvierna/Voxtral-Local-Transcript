@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 from array import array
 import base64
-from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
 import json
@@ -19,19 +18,28 @@ import threading
 import websockets
 
 from .audio import MicrophoneStream
+from .backend_contract import (
+    BackendCapabilities,
+    DeltaCallback,
+    RecordingStoppedCallback,
+)
 from .config import VoxtrayConfig
 
-DeltaCallback = Callable[[str], None]
-RecordingStoppedCallback = Callable[[], None]
 PCM16_SIGNAL_MIN_DURATION_SECONDS = 0.5
 PCM16_SIGNAL_PEAK_THRESHOLD = 16
 PCM16_SIGNAL_RMS_THRESHOLD = 1.0
 
 
 class RealtimeError(RuntimeError):
-    def __init__(self, message: str, payload: object | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        payload: object | None = None,
+        partial_text: str = "",
+    ) -> None:
         super().__init__(message)
         self.payload = payload
+        self.partial_text = partial_text
 
 
 def pcm16_signal_stats(raw_audio: bytes, sample_rate: int) -> dict[str, object]:
@@ -81,6 +89,8 @@ class TranscriptionCapture:
     source: str
     sample_rate: int
     chunk_ms: int
+    provider_id: str = ""
+    provider_model: str = ""
     input_path: Path | None = None
     requested_segment_max_seconds: float = 0.0
     effective_segment_max_seconds: float = 0.0
@@ -122,6 +132,8 @@ class TranscriptionCapture:
 
     def diagnostics(self) -> dict[str, object]:
         return {
+            "provider_id": self.provider_id,
+            "provider_model": self.provider_model,
             "completion_status": self.completion_status,
             "completion_reason": self.completion_reason,
             "fallback_used": self.fallback_used,
@@ -141,6 +153,14 @@ class _RealtimeReceiveState:
 
 
 class RealtimeTranscriber:
+    provider_id = "local_voxtral"
+    capabilities = BackendCapabilities(
+        realtime_microphone=True,
+        transcribe_file=True,
+        local_engine_required=True,
+        warm_supported=True,
+        model_control_supported=True,
+    )
     _SEGMENT_MAX_ATTEMPTS = 2
 
     def __init__(self, config: VoxtrayConfig) -> None:
@@ -151,6 +171,18 @@ class RealtimeTranscriber:
     @property
     def last_capture(self) -> TranscriptionCapture | None:
         return self._last_capture
+
+    @property
+    def provider_model(self) -> str:
+        return str(getattr(self.config, "model_id", ""))
+
+    @property
+    def sample_rate(self) -> int:
+        return self._audio_sample_rate()
+
+    @property
+    def chunk_ms(self) -> int:
+        return self._audio_chunk_ms()
 
     def _audio_sample_rate(self) -> int:
         return int(getattr(getattr(self.config, "audio", None), "sample_rate", 16000))
@@ -183,6 +215,8 @@ class RealtimeTranscriber:
             source=source,
             sample_rate=self._audio_sample_rate(),
             chunk_ms=self._audio_chunk_ms(),
+            provider_id=self.provider_id,
+            provider_model=self.provider_model,
             input_path=input_path,
         )
         self._last_capture = capture
@@ -262,6 +296,9 @@ class RealtimeTranscriber:
 
     def check_realtime_session_blocking(self) -> None:
         asyncio.run(self._check_realtime_session())
+
+    def check_ready_blocking(self) -> None:
+        self.check_realtime_session_blocking()
 
     def _engine_extra_args(self) -> list[str]:
         return list(getattr(getattr(self.config, "engine", None), "extra_args", []) or [])
@@ -500,7 +537,7 @@ class RealtimeTranscriber:
             message = f"{message}: {partial_text}"
         if capture is not None:
             capture.error_message = message
-        raise RealtimeError(message)
+        raise RealtimeError(message, partial_text=partial_text)
 
     async def _append_audio_chunk(self, ws, chunk: bytes) -> None:
         await ws.send(
@@ -628,7 +665,7 @@ class RealtimeTranscriber:
             message = f"{message}: {partial_text}"
         if capture is not None:
             capture.error_message = message
-        raise RealtimeError(message)
+        raise RealtimeError(message, partial_text=partial_text)
 
     async def _flush_stop_tail_streaming(
         self,
@@ -1404,3 +1441,6 @@ class RealtimeTranscriber:
     ) -> str:
         self.logger.debug("transcribing file: %s", shlex.quote(str(audio_path)))
         return asyncio.run(self.transcribe_file(audio_path, on_delta=on_delta))
+
+
+LocalVoxtralBackend = RealtimeTranscriber

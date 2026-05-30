@@ -1,5 +1,8 @@
 model_id = "mistralai/Voxtral-Mini-4B-Realtime-2602"
 
+[transcription]
+provider = "local_voxtral"
+
 [server]
 host = "127.0.0.1"
 port = 8000

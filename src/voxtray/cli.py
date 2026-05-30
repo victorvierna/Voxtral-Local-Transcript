@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+import json
 from pathlib import Path
 from typing import Literal
 
@@ -11,21 +12,29 @@ from .controller import Controller, handle_engine_error
 from .engine import EngineError
 from .gnome import GnomeShortcutError, install_toggle_shortcut
 from .logging_utils import configure_logging
-from .paths import APP_LOG_FILE, VLLM_LOG_FILE
+from .notify import notify
+from .paths import APP_LOG_FILE, RECORDINGS_DIR, VLLM_LOG_FILE
+from .quality import audit_recording_results, summarize_quality_results
+from .state import UNEXPECTED_RECORDING_EXIT_MESSAGE
 from .tray import run_tray
 from .worker import run_record_worker
 
 app = typer.Typer(
-    help="Voxtray: local Voxtral realtime transcription utility.",
+    help="Voxtray: realtime transcription utility with local and cloud providers.",
     pretty_exceptions_enable=False,
 )
 warm_app = typer.Typer(help="Warm engine controls.", pretty_exceptions_enable=False)
 model_app = typer.Typer(help="Model load/unload controls.", pretty_exceptions_enable=False)
 history_app = typer.Typer(help="History controls.", pretty_exceptions_enable=False)
+recordings_app = typer.Typer(
+    help="Recording artifact controls.",
+    pretty_exceptions_enable=False,
+)
 
 app.add_typer(warm_app, name="warm")
 app.add_typer(model_app, name="model")
 app.add_typer(history_app, name="history")
+app.add_typer(recordings_app, name="recordings")
 
 
 @app.callback()
@@ -93,6 +102,8 @@ def record(
         else:
             message = ctl.toggle_recording()
         typer.echo(message)
+        if message == UNEXPECTED_RECORDING_EXIT_MESSAGE:
+            notify("Voxtray Error", message, urgency="critical")
     except (EngineError, RuntimeError) as exc:
         typer.echo(handle_engine_error(exc), err=True)
         raise typer.Exit(1)
@@ -181,6 +192,73 @@ def history_copy(index: int = typer.Argument(..., min=1)) -> None:
 
     typer.echo(f"Copied history item {index} with backend={backend}.")
     typer.echo(str(entry.get("text", "")))
+
+
+@recordings_app.command("audit")
+def recordings_audit(
+    root: Path = typer.Option(
+        RECORDINGS_DIR,
+        "--root",
+        exists=False,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        help="Recording artifact root to scan.",
+    ),
+    limit: int = typer.Option(200, "--limit", min=1, help="Newest results to scan."),
+    show_passed: bool = typer.Option(
+        False,
+        "--show-passed",
+        help="Include passing recordings in the text report.",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Print machine-readable JSON.",
+    ),
+    fail_on_issues: bool = typer.Option(
+        False,
+        "--fail-on-issues/--no-fail-on-issues",
+        help="Exit with code 2 when any quality issue is found.",
+    ),
+) -> None:
+    results = audit_recording_results(root, limit=limit)
+    summary = summarize_quality_results(results)
+    if json_output:
+        typer.echo(
+            json.dumps(
+                {
+                    "root": str(root),
+                    "limit": limit,
+                    "summary": summary,
+                    "results": [result.as_dict() for result in results],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    else:
+        typer.echo(
+            f"Audited {summary['total']} recording(s): "
+            f"{summary['passed']} passed, {summary['failed']} with issues."
+        )
+        issue_counts = summary.get("issue_counts") or {}
+        if issue_counts:
+            typer.echo("Issue counts:")
+            for code, count in issue_counts.items():
+                typer.echo(f"  {code}: {count}")
+        for result in results:
+            if result.passed and not show_passed:
+                continue
+            status = "PASS" if result.passed else "ISSUE"
+            typer.echo(
+                f"{status} {result.path} "
+                f"duration={result.duration_seconds:.3f}s chars={result.text_chars}"
+            )
+            for issue in result.issues:
+                typer.echo(f"  - {issue.severity}:{issue.code}: {issue.message}")
+    if fail_on_issues and int(summary["failed"]) > 0:
+        raise typer.Exit(2)
 
 
 @app.command("transcribe-file")

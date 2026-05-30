@@ -20,6 +20,8 @@ from typing import Any
 
 import httpx
 
+from voxtray.backends import configured_provider, create_transcription_backend
+from voxtray.cloud_backends import _audio_file_to_pcm16_bytes
 from voxtray.config import VoxtrayConfig, load_config
 from voxtray.realtime import RealtimeError, RealtimeTranscriber
 
@@ -162,6 +164,14 @@ def similarity(reference: str, candidate: str) -> float:
     if not reference_norm or not candidate_norm:
         return 0.0
     return difflib.SequenceMatcher(None, reference_norm, candidate_norm).ratio()
+
+
+def estimate_cost_usd(provider: str, duration_seconds: float) -> float | None:
+    if provider == "local_voxtral":
+        return 0.0
+    if provider == "mistral_realtime":
+        return round((duration_seconds / 60.0) * 0.006, 6)
+    return None
 
 
 def audio_duration_seconds(audio_path: Path) -> float:
@@ -488,6 +498,8 @@ def enable_partial_timeout_acceptance(transcriber: RealtimeTranscriber) -> None:
 def base_result_row(
     *,
     variant: Variant,
+    provider: str,
+    provider_model: str,
     case: AudioCase,
     mode: str,
     wall_seconds: float,
@@ -497,10 +509,13 @@ def base_result_row(
     peak_vram_mb: int | None,
     capture: Any,
     post_stop_seconds: float | None = None,
+    first_delta_seconds: float | None = None,
 ) -> dict[str, Any]:
     capture_summary = summarize_capture(capture)
     return {
         "variant": variant.name,
+        "provider": provider,
+        "provider_model": provider_model,
         "mode": mode,
         "audio": case.name,
         "audio_path": str(case.audio_path),
@@ -508,6 +523,9 @@ def base_result_row(
         "wall_seconds": round(wall_seconds, 3),
         "post_stop_seconds": round(post_stop_seconds, 3)
         if post_stop_seconds is not None
+        else None,
+        "first_delta_seconds": round(first_delta_seconds, 3)
+        if first_delta_seconds is not None
         else None,
         "rtf": round(wall_seconds / case.duration_seconds, 4)
         if case.duration_seconds
@@ -519,22 +537,31 @@ def base_result_row(
         "reference_chars": len(case.reference_text),
         "similarity": round(similarity(case.reference_text, text), 4),
         "peak_vram_mb": peak_vram_mb,
+        "estimated_cost_usd": estimate_cost_usd(provider, case.duration_seconds),
         "_transcript": text,
         **capture_summary,
     }
 
 
 def benchmark_file_case(config: VoxtrayConfig, variant: Variant, case: AudioCase) -> dict[str, Any]:
-    transcriber = RealtimeTranscriber(config)
-    if variant.accept_partial_timeouts:
+    transcriber = create_transcription_backend(config)
+    if variant.accept_partial_timeouts and hasattr(transcriber, "_retry_segment_audio"):
         enable_partial_timeout_acceptance(transcriber)
     sampler = VramSampler()
-    sampler.start()
+    if transcriber.capabilities.local_engine_required:
+        sampler.start()
     start = time.perf_counter()
+    first_delta_at: list[float] = []
+
+    def on_delta(delta: str) -> None:
+        del delta
+        if not first_delta_at:
+            first_delta_at.append(time.perf_counter())
+
     error = ""
     text = ""
     try:
-        text = transcriber.transcribe_file_blocking(case.audio_path)
+        text = transcriber.transcribe_file_blocking(case.audio_path, on_delta=on_delta)
         status = "success"
     except RealtimeError as exc:
         status = "error"
@@ -546,6 +573,8 @@ def benchmark_file_case(config: VoxtrayConfig, variant: Variant, case: AudioCase
     peak_vram_mb = sampler.stop()
     return base_result_row(
         variant=variant,
+        provider=transcriber.provider_id,
+        provider_model=transcriber.provider_model,
         case=case,
         mode="file",
         wall_seconds=wall_seconds,
@@ -554,6 +583,7 @@ def benchmark_file_case(config: VoxtrayConfig, variant: Variant, case: AudioCase
         text=text,
         peak_vram_mb=peak_vram_mb,
         capture=transcriber.last_capture,
+        first_delta_seconds=(first_delta_at[0] - start) if first_delta_at else None,
     )
 
 
@@ -564,11 +594,11 @@ def benchmark_live_case(
     *,
     live_speed: float,
 ) -> dict[str, Any]:
-    transcriber = RealtimeTranscriber(config)
-    if variant.accept_partial_timeouts:
+    transcriber = create_transcription_backend(config)
+    if variant.accept_partial_timeouts and hasattr(transcriber, "_retry_segment_audio"):
         enable_partial_timeout_acceptance(transcriber)
-    raw_audio = transcriber._audio_file_to_pcm16_bytes(case.audio_path)
-    bytes_per_chunk = int(config.audio.sample_rate * 2 * (config.audio.chunk_ms / 1000.0))
+    raw_audio = _audio_file_to_pcm16_bytes(case.audio_path, int(transcriber.sample_rate))
+    bytes_per_chunk = int(transcriber.sample_rate * 2 * (transcriber.chunk_ms / 1000.0))
     bytes_per_chunk = max(2, bytes_per_chunk - (bytes_per_chunk % 2))
     chunks = [
         raw_audio[offset : offset + bytes_per_chunk]
@@ -577,7 +607,7 @@ def benchmark_live_case(
     ]
     mic = SimulatedMicrophoneStream(
         chunks,
-        chunk_seconds=max(0.001, config.audio.chunk_ms / 1000.0),
+        chunk_seconds=max(0.001, transcriber.chunk_ms / 1000.0),
         speed=live_speed,
     )
     stop_event = threading.Event()
@@ -591,14 +621,23 @@ def benchmark_live_case(
 
     stopper = threading.Thread(target=stop_after_audio, daemon=True)
     sampler = VramSampler()
-    sampler.start()
+    if transcriber.capabilities.local_engine_required:
+        sampler.start()
     start = time.perf_counter()
+    first_delta_at: list[float] = []
+
+    def on_delta(delta: str) -> None:
+        del delta
+        if not first_delta_at:
+            first_delta_at.append(time.perf_counter())
+
     stopper.start()
     error = ""
     text = ""
     try:
         text = transcriber.transcribe_microphone_blocking(
             stop_event,
+            on_delta=on_delta,
             mic=mic,  # type: ignore[arg-type]
             close_mic=True,
         )
@@ -619,6 +658,8 @@ def benchmark_live_case(
     )
     return base_result_row(
         variant=variant,
+        provider=transcriber.provider_id,
+        provider_model=transcriber.provider_model,
         case=case,
         mode="live",
         wall_seconds=wall_seconds,
@@ -628,6 +669,7 @@ def benchmark_live_case(
         text=text,
         peak_vram_mb=peak_vram_mb,
         capture=transcriber.last_capture,
+        first_delta_seconds=(first_delta_at[0] - start) if first_delta_at else None,
     )
 
 
@@ -651,8 +693,8 @@ def write_outputs(rows: list[dict[str, Any]], output_dir: Path) -> None:
         by_variant.setdefault(str(row["variant"]), []).append(row)
     with summary_path.open("w", encoding="utf-8") as handle:
         handle.write("# Voxtray Benchmark\n\n")
-        handle.write("| variant | mode | audios | avg rtf | p95 wall | p95 post-stop | min similarity | timeouts | retries | peak vram MB |\n")
-        handle.write("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+        handle.write("| variant | provider | mode | audios | avg rtf | p95 wall | p95 post-stop | min similarity | timeouts | retries | peak vram MB | est cost USD |\n")
+        handle.write("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
         for variant_name, variant_rows in by_variant.items():
             rtfs = sorted(float(row["rtf"] or 0.0) for row in variant_rows)
             walls = sorted(float(row["wall_seconds"]) for row in variant_rows)
@@ -671,13 +713,19 @@ def write_outputs(rows: list[dict[str, Any]], output_dir: Path) -> None:
                 [int(row["peak_vram_mb"]) for row in variant_rows if row["peak_vram_mb"] is not None]
                 or [0]
             )
+            costs = [
+                float(row["estimated_cost_usd"])
+                for row in variant_rows
+                if row["estimated_cost_usd"] is not None
+            ]
+            cost_text = f"{sum(costs):.6f}" if costs else ""
             handle.write(
-                f"| {variant_name} | {variant_rows[0].get('mode', '')} | {len(variant_rows)} | "
+                f"| {variant_name} | {variant_rows[0].get('provider', '')} | {variant_rows[0].get('mode', '')} | {len(variant_rows)} | "
                 f"{sum(rtfs) / len(rtfs):.3f} | {walls[p95_index]:.1f} | {post_stop} | "
                 f"{min(similarities):.3f} | "
                 f"{sum(int(row['timeouts']) for row in variant_rows)} | "
                 f"{sum(int(row['retries']) for row in variant_rows)} | "
-                f"{peak_vram or ''} |\n"
+                f"{peak_vram or ''} | {cost_text} |\n"
             )
 
 
@@ -711,7 +759,12 @@ def select_variants(names: list[str]) -> list[Variant]:
 def main() -> int:
     args = parse_args()
     base_config = load_config(args.config)
-    variants = select_variants(args.variant)
+    base_provider = configured_provider(base_config)
+    variants = (
+        [Variant(name=base_provider, max_model_len=0)]
+        if base_provider != "local_voxtral"
+        else select_variants(args.variant)
+    )
     if args.audio:
         corpus = []
         for audio_path in args.audio:
@@ -734,15 +787,22 @@ def main() -> int:
         print(f"  {case.name}: {case.duration_seconds:.1f}s", flush=True)
 
     for variant in variants:
-        config = apply_variant(base_config, variant, args.port)
+        config = (
+            copy.deepcopy(base_config)
+            if base_provider != "local_voxtral"
+            else apply_variant(base_config, variant, args.port)
+        )
         engine_proc: subprocess.Popen[bytes] | None = None
         load_seconds = 0.0
         log_path = output_dir / variant.name / "vllm.log"
         print(f"\n== {variant.name} ==", flush=True)
-        if args.reuse_running:
+        uses_local_engine = configured_provider(config) == "local_voxtral"
+        if not uses_local_engine:
+            print("cloud provider; skipping local vLLM startup", flush=True)
+        elif args.reuse_running:
             if not server_ready(config):
                 raise SystemExit("--reuse-running was set but the configured server is not ready")
-        else:
+        elif uses_local_engine:
             if server_ready(config, timeout_seconds=0.5):
                 raise SystemExit(
                     f"server already responds on {config.server_base_url}; stop it or use --reuse-running"
@@ -772,9 +832,10 @@ def main() -> int:
                 print(
                     f"{case.name}: {row['wall_seconds']:.1f}s "
                     f"post_stop={row['post_stop_seconds']} "
+                    f"first_delta={row['first_delta_seconds']} "
                     f"rtf={row['rtf']} sim={row['similarity']} "
                     f"segments={row['segments']} retries={row['retries']} "
-                    f"status={row['status']}",
+                    f"cost={row['estimated_cost_usd']} status={row['status']}",
                     flush=True,
                 )
                 write_outputs(rows, output_dir)

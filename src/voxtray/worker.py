@@ -6,16 +6,17 @@ import signal
 import threading
 from uuid import uuid4
 
+from .assistant_hook import AssistantRoute, route_text
 from .audio import MicrophoneStream
-from .clipboard import ClipboardError, copy_to_clipboard
+from .backends import create_transcription_backend
+from .clipboard import ClipboardError, copy_to_clipboard, verify_clipboard_text
 from .config import load_config
 from .engine import EngineError, EngineManager
 from .history import HistoryStore
-from .notify import notify
+from .notify import notify, speak
 from .postprocess import normalize_transcript
 from .recordings import RecordingArtifactStore
-from . import realtime as realtime_module
-from .realtime import RealtimeError, RealtimeTranscriber, TranscriptionCapture
+from .realtime import LocalVoxtralBackend, RealtimeError, TranscriptionCapture
 from .state import StateStore
 
 NO_MIC_SIGNAL_MESSAGE = (
@@ -38,6 +39,32 @@ def _publish_notice(
         last_notice_level=level,
     )
     notify(title, body, urgency=urgency)
+
+
+def _assistant_speech_enabled(config) -> bool:
+    assistant = getattr(config, "assistant", None)
+    return bool(getattr(assistant, "enabled", False)) and bool(
+        getattr(assistant, "speak_confirmations", False)
+    )
+
+
+def _speak_assistant_route(config, route: AssistantRoute) -> None:
+    if not _assistant_speech_enabled(config):
+        return
+    if route.action == "confirm":
+        speak(route.message or "Necesito confirmacion. Di si para aprobar, o no para cancelar.")
+    elif route.action == "error":
+        speak(route.message or "Harvis no esta disponible. No he copiado la orden.")
+    elif route.action == "blocked":
+        speak(route.message or "No he podido completar la accion.")
+    elif route.action == "queued" and route.confirmation_id:
+        speak(route.message or "Confirmado.")
+
+
+def _speak_feedback(config, text: str) -> None:
+    if not _assistant_speech_enabled(config):
+        return
+    speak(text)
 
 
 def _is_recoverable_runtime_failure(exc: Exception) -> bool:
@@ -80,16 +107,94 @@ def _mark_missing_microphone_signal(capture: TranscriptionCapture | None) -> str
     return message
 
 
+def _partial_text_from_error(exc: Exception) -> str:
+    partial_text = str(getattr(exc, "partial_text", "") or "").strip()
+    if partial_text:
+        return partial_text
+
+    marker = "after receiving partial transcript:"
+    message = str(exc)
+    if marker not in message:
+        return ""
+    partial = message.split(marker, 1)[1].strip()
+    if ";" in partial:
+        partial = partial.split(";", 1)[0].strip()
+    return partial
+
+
+def _record_saved_transcript_state(
+    state_store: StateStore,
+    *,
+    artifact_path: str,
+    history_entry: dict[str, object],
+) -> None:
+    state_store.set_values(
+        last_artifact_path=artifact_path,
+        last_history_id=str(history_entry.get("id", "") or ""),
+        last_history_index=1,
+        last_clipboard_backend="",
+        last_clipboard_verified=False,
+        last_clipboard_verification_supported=False,
+        last_clipboard_error="",
+    )
+
+
+def _record_artifact_state(state_store: StateStore, artifact_path: str) -> None:
+    if artifact_path:
+        state_store.set_values(last_artifact_path=artifact_path)
+
+
+def _record_clipboard_state(
+    state_store: StateStore,
+    *,
+    backend: str = "",
+    verified: bool | None = None,
+    error: str = "",
+) -> None:
+    state_store.set_values(
+        last_clipboard_backend=backend,
+        last_clipboard_verified=verified is True,
+        last_clipboard_verification_supported=verified is not None,
+        last_clipboard_error=error,
+    )
+
+
+def _record_assistant_state(state_store: StateStore, route: AssistantRoute) -> None:
+    state_store.set_values(
+        last_assistant_command_id=route.command_id,
+        last_assistant_route=route.action,
+        last_assistant_agent_id=route.agent_id,
+        last_assistant_error=route.error,
+    )
+
+
+def _check_backend_ready(transcriber) -> None:
+    check_ready = getattr(transcriber, "check_ready_blocking", None)
+    if callable(check_ready):
+        check_ready()
+        return
+    legacy_check = getattr(transcriber, "check_realtime_session_blocking", None)
+    if callable(legacy_check):
+        legacy_check()
+        return
+    raise RuntimeError("transcription backend has no readiness check")
+
+
 def run_record_worker() -> int:
     config = load_config()
     state_store = StateStore()
     history = HistoryStore(max_items=config.history.max_items)
     engine = EngineManager(config, state_store)
-    transcriber = RealtimeTranscriber(config)
+    transcriber = create_transcription_backend(config)
+    capabilities = getattr(transcriber, "capabilities", None)
+    requires_local_engine = bool(
+        getattr(capabilities, "local_engine_required", True)
+    )
     recording_store = RecordingArtifactStore()
     logger = logging.getLogger("voxtray.worker")
 
     stop_event = threading.Event()
+    worker_done_event = threading.Event()
     mic: MicrophoneStream | None = None
 
     def _signal_handler(signum, frame) -> None:  # type: ignore[no-untyped-def]
@@ -109,7 +214,13 @@ def run_record_worker() -> int:
     ):
         return recording_store.save(
             source=capture.source,
-            model_id=config.model_id,
+            model_id=str(
+                getattr(transcriber, "provider_model", getattr(config, "model_id", ""))
+            ),
+            provider_id=capture.provider_id
+            or str(getattr(transcriber, "provider_id", "local_voxtral")),
+            provider_model=capture.provider_model
+            or str(getattr(transcriber, "provider_model", getattr(config, "model_id", ""))),
             sample_rate=capture.sample_rate,
             chunk_ms=capture.chunk_ms,
             pcm16_audio=capture.audio_bytes(),
@@ -140,12 +251,38 @@ def run_record_worker() -> int:
         mic = None
 
     def _engine_ready_for_recording() -> bool:
+        if not requires_local_engine:
+            return True
         return engine.is_ready(timeout_seconds=1.5)
 
     recording_stop_state_published = False
+    processing_watchdog_started = False
+
+    def _schedule_processing_watchdog() -> None:
+        def _tick() -> None:
+            if worker_done_event.is_set():
+                return
+            state = state_store.read()
+            if (
+                state.get("recording_pid") == os.getpid()
+                and state.get("activity_state")
+                in {"transcribing", "routing", "copying"}
+            ):
+                _publish_notice(
+                    state_store,
+                    "Voxtray",
+                    "Still transcribing; keep waiting",
+                )
+                _speak_feedback(config, "Sigo transcribiendo.")
+                _schedule_processing_watchdog()
+
+        timer = threading.Timer(30.0, _tick)
+        timer.daemon = True
+        timer.start()
 
     def _publish_recording_stopped_state() -> None:
         nonlocal recording_stop_state_published
+        nonlocal processing_watchdog_started
         if recording_stop_state_published:
             return
         recording_stop_state_published = True
@@ -153,6 +290,15 @@ def run_record_worker() -> int:
             recording_stop_requested=True,
             activity_state="transcribing",
         )
+        _publish_notice(
+            state_store,
+            "Voxtray",
+            "Recording stopped; transcribing",
+        )
+        _speak_feedback(config, "Transcribiendo.")
+        if not processing_watchdog_started:
+            processing_watchdog_started = True
+            _schedule_processing_watchdog()
 
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
@@ -176,26 +322,29 @@ def run_record_worker() -> int:
 
         text = ""
         normalized_text = ""
-        max_attempts = 2
+        max_attempts = 2 if requires_local_engine else 1
         saved_artifact_path = ""
         completed_attempt = 1
         for attempt in range(1, max_attempts + 1):
             try:
-                if attempt > 1:
+                if attempt > 1 and requires_local_engine:
                     engine_ready = _engine_ready_for_recording()
                 state_store.set_values(
                     activity_state="recording" if engine_ready else "loading_model"
                 )
-                engine.ensure_running()
+                if requires_local_engine:
+                    engine.ensure_running()
                 if stop_event.is_set():
                     return 0
-                transcriber.check_realtime_session_blocking()
+                _check_backend_ready(transcriber)
                 if stop_event.is_set():
                     return 0
                 if mic is None:
                     mic = MicrophoneStream(
-                        sample_rate=config.audio.sample_rate,
-                        chunk_ms=config.audio.chunk_ms,
+                        sample_rate=int(
+                            getattr(transcriber, "sample_rate", config.audio.sample_rate)
+                        ),
+                        chunk_ms=int(getattr(transcriber, "chunk_ms", config.audio.chunk_ms)),
                         device=config.audio.device,
                         max_queue_chunks=config.realtime.mic_queue_chunks,
                     )
@@ -216,7 +365,7 @@ def run_record_worker() -> int:
                     _publish_recording_stopped_state()
                 completed_attempt = attempt
                 break
-            except (EngineError, RealtimeError) as exc:
+            except Exception as exc:
                 failure_exc: Exception = exc
                 capture = transcriber.last_capture
                 artifact = None
@@ -239,11 +388,13 @@ def run_record_worker() -> int:
                         max_attempts=max_attempts,
                     )
                     saved_artifact_path = str(artifact.directory)
+                    _record_artifact_state(state_store, saved_artifact_path)
                     logger.info("saved failed recording artifact: %s", artifact.directory)
 
                 if (
                     isinstance(exc, RealtimeError)
                     and stop_event.is_set()
+                    and requires_local_engine
                     and capture is not None
                     and capture.audio_bytes()
                     and artifact is not None
@@ -261,7 +412,7 @@ def run_record_worker() -> int:
                         }
                     )
                     state_store.set_values(activity_state="transcribing")
-                    fallback_transcriber = RealtimeTranscriber(config)
+                    fallback_transcriber = create_transcription_backend(config)
                     try:
                         fallback_text = fallback_transcriber.transcribe_file_blocking(
                             artifact.audio_path
@@ -277,6 +428,7 @@ def run_record_worker() -> int:
                             f"{exc}; offline fallback failed: {fallback_exc}",
                             payload=getattr(fallback_exc, "payload", None)
                             or getattr(exc, "payload", None),
+                            partial_text=_partial_text_from_error(exc),
                         )
                     else:
                         fallback_capture = fallback_transcriber.last_capture
@@ -305,6 +457,7 @@ def run_record_worker() -> int:
                         failure_exc = RealtimeError(
                             f"{exc}; offline fallback produced no transcript text",
                             payload=getattr(exc, "payload", None),
+                            partial_text=_partial_text_from_error(exc),
                         )
                     artifact = _save_capture_artifact(
                         capture,
@@ -318,6 +471,7 @@ def run_record_worker() -> int:
                         max_attempts=max_attempts,
                     )
                     saved_artifact_path = str(artifact.directory)
+                    _record_artifact_state(state_store, saved_artifact_path)
                     logger.info(
                         "saved failed recording artifact with fallback diagnostics: %s",
                         artifact.directory,
@@ -327,7 +481,26 @@ def run_record_worker() -> int:
                     attempt < max_attempts
                     and not stop_event.is_set()
                     and _is_recoverable_runtime_failure(failure_exc)
+                    and requires_local_engine
                 )
+                if not can_retry and stop_event.is_set():
+                    partial_text = _partial_text_from_error(failure_exc)
+                    if partial_text:
+                        logger.warning(
+                            "using partial transcript after finalization failure: %s",
+                            partial_text,
+                        )
+                        capture = transcriber.last_capture
+                        if capture is not None:
+                            capture.raw_text = partial_text
+                            capture.completion_status = "partial"
+                            capture.completion_reason = str(failure_exc)
+                            capture.error_message = str(failure_exc)
+                            if partial_text not in capture.segment_texts:
+                                capture.segment_texts.append(partial_text)
+                        text = partial_text
+                        completed_attempt = attempt
+                        break
                 if not can_retry:
                     raise failure_exc
                 logger.warning(
@@ -337,7 +510,8 @@ def run_record_worker() -> int:
                     failure_exc,
                 )
                 state_store.set_values(last_error=str(failure_exc))
-                engine.stop_if_running(timeout_seconds=5.0)
+                if requires_local_engine:
+                    engine.stop_if_running(timeout_seconds=5.0)
 
         if config.postprocess.clean_text:
             normalized_text = normalize_transcript(text)
@@ -346,19 +520,37 @@ def run_record_worker() -> int:
 
         capture = transcriber.last_capture
         missing_signal_message = ""
+        partial_result = False
         if capture is not None:
             capture.raw_text = text
             missing_signal_message = _mark_missing_microphone_signal(capture)
-            completion_problem = realtime_module.RealtimeTranscriber.completion_problem(
-                capture,
-                normalized_text,
+            if missing_signal_message and normalized_text.strip():
+                logger.warning(
+                    "discarding transcript from no-signal microphone capture: %s",
+                    normalized_text,
+                )
+                normalized_text = ""
+            partial_result = (
+                capture.completion_status == "partial" and bool(normalized_text.strip())
             )
+            provider_id = str(
+                getattr(capture, "provider_id", "")
+                or getattr(transcriber, "provider_id", "local_voxtral")
+            )
+            completion_problem = ""
+            if not partial_result and provider_id in {"", "local_voxtral"}:
+                completion_problem = LocalVoxtralBackend.completion_problem(
+                    capture,
+                    normalized_text,
+                )
             if completion_problem:
                 capture.completion_status = "incomplete"
                 capture.completion_reason = completion_problem
                 capture.error_message = completion_problem
             artifact_status = (
-                "error"
+                "partial"
+                if partial_result
+                else "error"
                 if completion_problem
                 else ("success" if normalized_text else "empty")
             )
@@ -373,32 +565,119 @@ def run_record_worker() -> int:
                 error_payload=capture.error_payload,
             )
             saved_artifact_path = str(artifact.directory)
+            _record_artifact_state(state_store, saved_artifact_path)
             logger.info("saved recording artifact: %s", artifact.directory)
             if completion_problem:
                 raise RealtimeError(completion_problem, payload=capture.error_payload)
 
         if normalized_text:
-            state_store.set_values(activity_state="copying")
+            worker_done_event.set()
             state_store.set_values(last_error="")
-            history.add_entry(normalized_text)
-            try:
-                copy_to_clipboard(normalized_text, backend=config.clipboard.backend)
-                _publish_notice(
+            state_store.set_values(activity_state="routing")
+            assistant_route = route_text(
+                normalized_text,
+                artifact_path=saved_artifact_path,
+                provider=provider_id,
+                config=config,
+            )
+            _record_assistant_state(state_store, assistant_route)
+            if assistant_route.action == "error":
+                _record_clipboard_state(
                     state_store,
-                    "Voxtray",
-                    "Transcription copied to clipboard",
-                    level="info",
+                    error=assistant_route.error or assistant_route.message,
                 )
-            except ClipboardError as exc:
-                logger.warning("clipboard copy failed: %s", exc)
+                state_store.set_values(
+                    last_error=assistant_route.error or assistant_route.message,
+                    last_history_id="",
+                    last_history_index=0,
+                )
                 _publish_notice(
                     state_store,
-                    "Voxtray",
-                    "Transcription done (clipboard backend missing)",
+                    "Harvis",
+                    assistant_route.message or "Assistant hook failed",
                     level="warning",
                     urgency="normal",
                 )
+                _speak_assistant_route(config, assistant_route)
+            elif assistant_route.action in {"agent", "confirm", "queued", "blocked"}:
+                _record_clipboard_state(
+                    state_store,
+                    error=f"not copied: assistant route {assistant_route.action}",
+                )
+                state_store.set_values(last_history_id="", last_history_index=0)
+                level = "warning" if assistant_route.action in {"confirm", "blocked"} else "info"
+                _publish_notice(
+                    state_store,
+                    "Harvis",
+                    assistant_route.message or f"Route: {assistant_route.action}",
+                    level=level,
+                    urgency="normal",
+                )
+                _speak_assistant_route(config, assistant_route)
+            else:
+                state_store.set_values(activity_state="copying")
+                history_entry = history.add_entry(normalized_text)
+                _record_saved_transcript_state(
+                    state_store,
+                    artifact_path=saved_artifact_path,
+                    history_entry=history_entry,
+                )
+                _record_assistant_state(state_store, assistant_route)
+                try:
+                    backend = copy_to_clipboard(normalized_text, backend=config.clipboard.backend)
+                    verified = verify_clipboard_text(normalized_text, backend)
+                    _record_clipboard_state(
+                        state_store,
+                        backend=backend,
+                        verified=verified,
+                        error="" if verified is not False else "clipboard verification mismatch",
+                    )
+                    if verified is False:
+                        _publish_notice(
+                            state_store,
+                            "Voxtray",
+                            "Transcription saved; clipboard copy not verified",
+                            level="warning",
+                            urgency="critical",
+                        )
+                        _speak_feedback(
+                            config,
+                            "Transcripcion guardada, pero no he podido verificar el portapapeles.",
+                        )
+                    elif partial_result:
+                        _publish_notice(
+                            state_store,
+                            "Voxtray",
+                            "Partial transcription saved and copied",
+                            level="warning",
+                            urgency="critical",
+                        )
+                        _speak_feedback(config, "Transcripcion parcial copiada.")
+                    else:
+                        _publish_notice(
+                            state_store,
+                            "Voxtray",
+                            "Transcription copied to clipboard",
+                            level="info",
+                            urgency="critical",
+                        )
+                        _speak_feedback(config, "Transcripcion copiada.")
+                except ClipboardError as exc:
+                    logger.warning("clipboard copy failed: %s", exc)
+                    _record_clipboard_state(state_store, error=str(exc))
+                    _publish_notice(
+                        state_store,
+                        "Voxtray",
+                        "Transcription saved; clipboard copy failed",
+                        level="warning",
+                        urgency="critical",
+                    )
+                    _speak_feedback(
+                        config,
+                        "Transcripcion guardada, pero no he podido copiarla.",
+                    )
         else:
+            worker_done_event.set()
             logger.warning("recording finished without transcript text")
             if missing_signal_message:
                 state_store.set_values(last_error=missing_signal_message)
@@ -409,6 +688,7 @@ def run_record_worker() -> int:
                     level="warning",
                     urgency="normal",
                 )
+                _speak_feedback(config, "No he detectado señal del microfono.")
             else:
                 state_store.set_values(
                     last_error=(
@@ -422,8 +702,10 @@ def run_record_worker() -> int:
                     level="warning",
                     urgency="normal",
                 )
+                _speak_feedback(config, "No he detectado texto.")
 
-    except (EngineError, RealtimeError, OSError, RuntimeError) as exc:
+    except Exception as exc:
+        worker_done_event.set()
         logger.exception("record worker failed: %s", exc)
         message = str(exc)
         if saved_artifact_path:
@@ -436,8 +718,10 @@ def run_record_worker() -> int:
             level="error",
             urgency="critical",
         )
+        _speak_feedback(config, "Error en la transcripcion.")
         return 1
     finally:
+        worker_done_event.set()
         if mic is not None:
             mic.stop()
         state = state_store.read()
@@ -446,7 +730,7 @@ def run_record_worker() -> int:
             recording_stop_requested=False,
             activity_state="idle",
         )
-        if not state.get("warm_enabled"):
+        if requires_local_engine and not state.get("warm_enabled"):
             try:
                 engine.stop_if_running()
             except EngineError:

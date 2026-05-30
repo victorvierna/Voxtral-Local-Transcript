@@ -3,8 +3,9 @@ from copy import deepcopy
 import signal
 from types import SimpleNamespace
 
+from voxtray.assistant_hook import AssistantRoute
 from voxtray.realtime import RealtimeError, TranscriptionCapture
-from voxtray.worker import NO_MIC_SIGNAL_MESSAGE, run_record_worker
+from voxtray.worker import NO_MIC_SIGNAL_MESSAGE, _speak_feedback, run_record_worker
 
 
 class DummyStateStore:
@@ -112,6 +113,19 @@ def _build_config():
     )
 
 
+def test_speak_feedback_requires_assistant_enabled(monkeypatch):
+    spoken: list[str] = []
+    config = SimpleNamespace(
+        assistant=SimpleNamespace(enabled=False, speak_confirmations=True)
+    )
+
+    monkeypatch.setattr("voxtray.worker.speak", lambda text: spoken.append(text))
+
+    _speak_feedback(config, "Transcripcion copiada.")
+
+    assert spoken == []
+
+
 def test_run_record_worker_saves_success_artifact(monkeypatch):
     state_store = DummyStateStore()
     history_store = DummyHistoryStore(max_items=5)
@@ -147,7 +161,7 @@ def test_run_record_worker_saves_success_artifact(monkeypatch):
     monkeypatch.setattr("voxtray.worker.StateStore", lambda: state_store)
     monkeypatch.setattr("voxtray.worker.HistoryStore", lambda max_items: history_store)
     monkeypatch.setattr("voxtray.worker.EngineManager", DummyEngineManager)
-    monkeypatch.setattr("voxtray.worker.RealtimeTranscriber", SuccessTranscriber)
+    monkeypatch.setattr("voxtray.worker.create_transcription_backend", lambda config: SuccessTranscriber(config))
     monkeypatch.setattr("voxtray.worker.MicrophoneStream", DummyMicrophoneStream)
     monkeypatch.setattr("voxtray.worker.RecordingArtifactStore", lambda: artifact_store)
     monkeypatch.setattr("voxtray.worker.notify", lambda *args, **kwargs: None)
@@ -163,6 +177,11 @@ def test_run_record_worker_saves_success_artifact(monkeypatch):
     assert artifact_store.saved[0]["normalized_text"] == "HOLA MUNDO"
     assert state_store.values["last_error"] == ""
     assert state_store.values["activity_state"] == "idle"
+    assert state_store.values["last_artifact_path"] == "/tmp/voxtray-artifact"
+    assert state_store.values["last_history_index"] == 1
+    assert state_store.values["last_clipboard_backend"] == "auto"
+    assert state_store.values["last_clipboard_verified"] is False
+    assert state_store.values["last_clipboard_verification_supported"] is False
     assert state_store.values["last_notice_title"] == "Voxtray"
     assert state_store.values["last_notice_body"] == "Transcription copied to clipboard"
     assert state_store.values["last_notice_level"] == "info"
@@ -170,6 +189,202 @@ def test_run_record_worker_saves_success_artifact(monkeypatch):
     assert seen["close_mic"] is False
     assert DummyMicrophoneStream.instances[0].started is True
     assert DummyMicrophoneStream.instances[0].stopped is True
+
+
+def test_run_record_worker_routes_wake_command_without_copying(monkeypatch):
+    state_store = DummyStateStore()
+    history_store = DummyHistoryStore(max_items=5)
+    artifact_store = DummyRecordingArtifactStore()
+    DummyMicrophoneStream.instances = []
+    copied: list[str] = []
+
+    capture = TranscriptionCapture(
+        source="microphone",
+        sample_rate=16000,
+        chunk_ms=40,
+        provider_id="openai_realtime",
+    )
+    capture.append_audio_chunk(b"\x01\x00" * 160)
+
+    class SuccessTranscriber:
+        def __init__(self, config) -> None:
+            self.config = config
+            self.last_capture = capture
+
+        def transcribe_microphone_blocking(
+            self,
+            stop_event,
+            mic=None,
+            close_mic=True,
+            on_recording_stopped=None,
+        ):
+            del stop_event, mic, close_mic, on_recording_stopped
+            return "Harvis, revisa estado de agentes"
+
+        def check_realtime_session_blocking(self) -> None:
+            return None
+
+    monkeypatch.setattr("voxtray.worker.load_config", _build_config)
+    monkeypatch.setattr("voxtray.worker.StateStore", lambda: state_store)
+    monkeypatch.setattr("voxtray.worker.HistoryStore", lambda max_items: history_store)
+    monkeypatch.setattr("voxtray.worker.EngineManager", DummyEngineManager)
+    monkeypatch.setattr("voxtray.worker.create_transcription_backend", lambda config: SuccessTranscriber(config))
+    monkeypatch.setattr("voxtray.worker.MicrophoneStream", DummyMicrophoneStream)
+    monkeypatch.setattr("voxtray.worker.RecordingArtifactStore", lambda: artifact_store)
+    monkeypatch.setattr("voxtray.worker.notify", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "voxtray.worker.copy_to_clipboard",
+        lambda text, backend: copied.append(text) or backend,
+    )
+    monkeypatch.setattr("voxtray.worker.normalize_transcript", lambda text: text)
+    monkeypatch.setattr("voxtray.worker.signal.signal", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "voxtray.worker.route_text",
+        lambda *args, **kwargs: AssistantRoute(
+            action="agent",
+            command_id="cmd_1",
+            agent_id="Harvis",
+            message="Procesando con Harvis",
+        ),
+    )
+
+    result = run_record_worker()
+
+    assert result == 0
+    assert copied == []
+    assert history_store.entries == []
+    assert state_store.values["last_assistant_route"] == "agent"
+    assert state_store.values["last_assistant_command_id"] == "cmd_1"
+    assert state_store.values["last_assistant_agent_id"] == "Harvis"
+    assert state_store.values["last_notice_title"] == "Harvis"
+    assert state_store.values["last_notice_body"] == "Procesando con Harvis"
+    assert state_store.values["last_clipboard_error"] == "not copied: assistant route agent"
+
+
+def test_run_record_worker_speaks_assistant_error_without_copying(monkeypatch):
+    state_store = DummyStateStore()
+    history_store = DummyHistoryStore(max_items=5)
+    artifact_store = DummyRecordingArtifactStore()
+    DummyMicrophoneStream.instances = []
+    copied: list[str] = []
+    spoken: list[str] = []
+    config = _build_config()
+    config.assistant = SimpleNamespace(enabled=True, speak_confirmations=True)
+
+    capture = TranscriptionCapture(
+        source="microphone",
+        sample_rate=16000,
+        chunk_ms=40,
+        provider_id="openai_realtime",
+    )
+    capture.append_audio_chunk(b"\x01\x00" * 160)
+
+    class SuccessTranscriber:
+        def __init__(self, config) -> None:
+            self.config = config
+            self.last_capture = capture
+
+        def transcribe_microphone_blocking(
+            self,
+            stop_event,
+            mic=None,
+            close_mic=True,
+            on_recording_stopped=None,
+        ):
+            del stop_event, mic, close_mic, on_recording_stopped
+            return "Harvis, manda un correo"
+
+        def check_realtime_session_blocking(self) -> None:
+            return None
+
+    monkeypatch.setattr("voxtray.worker.load_config", lambda: config)
+    monkeypatch.setattr("voxtray.worker.StateStore", lambda: state_store)
+    monkeypatch.setattr("voxtray.worker.HistoryStore", lambda max_items: history_store)
+    monkeypatch.setattr("voxtray.worker.EngineManager", DummyEngineManager)
+    monkeypatch.setattr("voxtray.worker.create_transcription_backend", lambda config: SuccessTranscriber(config))
+    monkeypatch.setattr("voxtray.worker.MicrophoneStream", DummyMicrophoneStream)
+    monkeypatch.setattr("voxtray.worker.RecordingArtifactStore", lambda: artifact_store)
+    monkeypatch.setattr("voxtray.worker.notify", lambda *args, **kwargs: None)
+    monkeypatch.setattr("voxtray.worker.speak", lambda text: spoken.append(text))
+    monkeypatch.setattr(
+        "voxtray.worker.copy_to_clipboard",
+        lambda text, backend: copied.append(text) or backend,
+    )
+    monkeypatch.setattr("voxtray.worker.normalize_transcript", lambda text: text)
+    monkeypatch.setattr("voxtray.worker.signal.signal", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "voxtray.worker.route_text",
+        lambda *args, **kwargs: AssistantRoute(
+            action="error",
+            message="assistant unavailable: connection refused",
+            error="assistant unavailable: connection refused",
+        ),
+    )
+
+    result = run_record_worker()
+
+    assert result == 0
+    assert copied == []
+    assert history_store.entries == []
+    assert spoken == ["assistant unavailable: connection refused"]
+    assert state_store.values["last_error"] == "assistant unavailable: connection refused"
+    assert state_store.values["last_notice_title"] == "Harvis"
+    assert state_store.values["last_notice_body"] == "assistant unavailable: connection refused"
+    assert state_store.values["last_clipboard_error"] == "assistant unavailable: connection refused"
+
+
+def test_run_record_worker_warns_when_clipboard_verification_fails(monkeypatch):
+    state_store = DummyStateStore()
+    history_store = DummyHistoryStore(max_items=5)
+    artifact_store = DummyRecordingArtifactStore()
+    DummyMicrophoneStream.instances = []
+
+    capture = TranscriptionCapture(source="microphone", sample_rate=16000, chunk_ms=40)
+    capture.append_audio_chunk(b"\x01\x00" * 160)
+
+    class SuccessTranscriber:
+        def __init__(self, config) -> None:
+            self.config = config
+            self.last_capture = capture
+
+        def transcribe_microphone_blocking(
+            self,
+            stop_event,
+            mic=None,
+            close_mic=True,
+            on_recording_stopped=None,
+        ):
+            del stop_event, mic, close_mic, on_recording_stopped
+            return "hola"
+
+        def check_realtime_session_blocking(self) -> None:
+            return None
+
+    monkeypatch.setattr("voxtray.worker.load_config", _build_config)
+    monkeypatch.setattr("voxtray.worker.StateStore", lambda: state_store)
+    monkeypatch.setattr("voxtray.worker.HistoryStore", lambda max_items: history_store)
+    monkeypatch.setattr("voxtray.worker.EngineManager", DummyEngineManager)
+    monkeypatch.setattr("voxtray.worker.create_transcription_backend", lambda config: SuccessTranscriber(config))
+    monkeypatch.setattr("voxtray.worker.MicrophoneStream", DummyMicrophoneStream)
+    monkeypatch.setattr("voxtray.worker.RecordingArtifactStore", lambda: artifact_store)
+    monkeypatch.setattr("voxtray.worker.notify", lambda *args, **kwargs: None)
+    monkeypatch.setattr("voxtray.worker.copy_to_clipboard", lambda text, backend: "xclip")
+    monkeypatch.setattr("voxtray.worker.verify_clipboard_text", lambda text, backend: False)
+    monkeypatch.setattr("voxtray.worker.normalize_transcript", lambda text: text)
+    monkeypatch.setattr("voxtray.worker.signal.signal", lambda *args, **kwargs: None)
+
+    result = run_record_worker()
+
+    assert result == 0
+    assert history_store.entries == ["hola"]
+    assert state_store.values["last_clipboard_backend"] == "xclip"
+    assert state_store.values["last_clipboard_verified"] is False
+    assert state_store.values["last_clipboard_verification_supported"] is True
+    assert state_store.values["last_clipboard_error"] == "clipboard verification mismatch"
+    assert state_store.values["last_notice_body"] == (
+        "Transcription saved; clipboard copy not verified"
+    )
+    assert state_store.values["last_notice_level"] == "warning"
 
 
 def test_run_record_worker_loads_engine_before_starting_microphone(monkeypatch):
@@ -213,7 +428,7 @@ def test_run_record_worker_loads_engine_before_starting_microphone(monkeypatch):
     monkeypatch.setattr("voxtray.worker.StateStore", lambda: state_store)
     monkeypatch.setattr("voxtray.worker.HistoryStore", lambda max_items: history_store)
     monkeypatch.setattr("voxtray.worker.EngineManager", OrderedEngineManager)
-    monkeypatch.setattr("voxtray.worker.RealtimeTranscriber", SuccessTranscriber)
+    monkeypatch.setattr("voxtray.worker.create_transcription_backend", lambda config: SuccessTranscriber(config))
     monkeypatch.setattr("voxtray.worker.MicrophoneStream", OrderedMicrophoneStream)
     monkeypatch.setattr("voxtray.worker.RecordingArtifactStore", lambda: artifact_store)
     monkeypatch.setattr("voxtray.worker.notify", lambda *args, **kwargs: None)
@@ -225,6 +440,221 @@ def test_run_record_worker_loads_engine_before_starting_microphone(monkeypatch):
 
     assert result == 0
     assert events == ["engine", "canary", "mic", "transcribe"]
+
+
+def test_run_record_worker_does_not_touch_engine_for_cloud_provider(monkeypatch):
+    state_store = DummyStateStore()
+    history_store = DummyHistoryStore(max_items=5)
+    artifact_store = DummyRecordingArtifactStore()
+    DummyMicrophoneStream.instances = []
+    events: list[str] = []
+
+    capture = TranscriptionCapture(
+        source="microphone",
+        sample_rate=24000,
+        chunk_ms=40,
+        provider_id="openai_realtime",
+        provider_model="gpt-4o-transcribe",
+    )
+    capture.append_audio_chunk(b"\x01\x00" * 160)
+
+    class CloudBackend:
+        provider_id = "openai_realtime"
+        provider_model = "gpt-4o-transcribe"
+        sample_rate = 24000
+        chunk_ms = 40
+        capabilities = SimpleNamespace(local_engine_required=False)
+        last_capture = capture
+
+        def check_ready_blocking(self) -> None:
+            events.append("ready")
+
+        def transcribe_microphone_blocking(
+            self,
+            stop_event,
+            mic=None,
+            close_mic=True,
+            on_recording_stopped=None,
+        ):
+            del stop_event, close_mic, on_recording_stopped
+            assert mic is DummyMicrophoneStream.instances[0]
+            events.append("transcribe")
+            return "hola cloud"
+
+    class EngineShouldNotRun(DummyEngineManager):
+        def is_ready(self, timeout_seconds: float = 1.5) -> bool:
+            raise AssertionError("cloud provider should not check local engine readiness")
+
+        def ensure_running(self) -> None:
+            raise AssertionError("cloud provider should not start local engine")
+
+        def stop_if_running(self, timeout_seconds: float = 5.0) -> None:
+            raise AssertionError("cloud provider should not stop local engine")
+
+    monkeypatch.setattr("voxtray.worker.load_config", _build_config)
+    monkeypatch.setattr("voxtray.worker.StateStore", lambda: state_store)
+    monkeypatch.setattr("voxtray.worker.HistoryStore", lambda max_items: history_store)
+    monkeypatch.setattr("voxtray.worker.EngineManager", EngineShouldNotRun)
+    monkeypatch.setattr("voxtray.worker.create_transcription_backend", lambda config: CloudBackend())
+    monkeypatch.setattr("voxtray.worker.MicrophoneStream", DummyMicrophoneStream)
+    monkeypatch.setattr("voxtray.worker.RecordingArtifactStore", lambda: artifact_store)
+    monkeypatch.setattr("voxtray.worker.notify", lambda *args, **kwargs: None)
+    monkeypatch.setattr("voxtray.worker.copy_to_clipboard", lambda text, backend: backend)
+    monkeypatch.setattr("voxtray.worker.normalize_transcript", lambda text: text)
+    monkeypatch.setattr("voxtray.worker.signal.signal", lambda *args, **kwargs: None)
+
+    result = run_record_worker()
+
+    assert result == 0
+    assert events == ["ready", "transcribe"]
+    assert DummyMicrophoneStream.instances[0].sample_rate == 24000
+    assert history_store.entries == ["hola cloud"]
+    assert artifact_store.saved[0]["provider_id"] == "openai_realtime"
+    assert artifact_store.saved[0]["provider_model"] == "gpt-4o-transcribe"
+
+
+def test_run_record_worker_keeps_cloud_full_fallback_recovery(monkeypatch):
+    state_store = DummyStateStore()
+    history_store = DummyHistoryStore(max_items=5)
+    artifact_store = DummyRecordingArtifactStore()
+    DummyMicrophoneStream.instances = []
+
+    capture = TranscriptionCapture(
+        source="microphone",
+        sample_rate=24000,
+        chunk_ms=40,
+        provider_id="openai_realtime",
+        provider_model="gpt-realtime-whisper",
+    )
+    capture.append_audio_chunk(b"\x01\x00" * 24000 * 60)
+    capture.fallback_used = True
+    capture.fallback_source = "openai_audio_transcriptions:gpt-4o-transcribe"
+    capture.events.append(
+        {
+            "event": "openai_audio_api_fallback_completed",
+            "scope": "full",
+            "text_chars": len("texto recuperado completo"),
+        }
+    )
+    capture.segments.append(
+        {
+            "index": 1,
+            "source": "microphone",
+            "status": "success",
+            "text_chars": 10,
+        }
+    )
+    capture.segments.append(
+        {
+            "index": 2,
+            "source": "microphone",
+            "status": "error",
+            "error": "segment timed out",
+            "fallback_used": True,
+        }
+    )
+
+    class CloudRecoveredBackend:
+        provider_id = "openai_realtime"
+        provider_model = "gpt-realtime-whisper"
+        sample_rate = 24000
+        chunk_ms = 40
+        capabilities = SimpleNamespace(local_engine_required=False)
+        last_capture = capture
+
+        def check_ready_blocking(self) -> None:
+            return None
+
+        def transcribe_microphone_blocking(
+            self,
+            stop_event,
+            mic=None,
+            close_mic=True,
+            on_recording_stopped=None,
+        ):
+            del stop_event, mic, close_mic, on_recording_stopped
+            return "texto recuperado completo"
+
+    monkeypatch.setattr("voxtray.worker.load_config", _build_config)
+    monkeypatch.setattr("voxtray.worker.StateStore", lambda: state_store)
+    monkeypatch.setattr("voxtray.worker.HistoryStore", lambda max_items: history_store)
+    monkeypatch.setattr("voxtray.worker.EngineManager", DummyEngineManager)
+    monkeypatch.setattr(
+        "voxtray.worker.create_transcription_backend",
+        lambda config: CloudRecoveredBackend(),
+    )
+    monkeypatch.setattr("voxtray.worker.MicrophoneStream", DummyMicrophoneStream)
+    monkeypatch.setattr("voxtray.worker.RecordingArtifactStore", lambda: artifact_store)
+    monkeypatch.setattr("voxtray.worker.notify", lambda *args, **kwargs: None)
+    monkeypatch.setattr("voxtray.worker.copy_to_clipboard", lambda text, backend: backend)
+    monkeypatch.setattr("voxtray.worker.normalize_transcript", lambda text: text)
+    monkeypatch.setattr("voxtray.worker.signal.signal", lambda *args, **kwargs: None)
+
+    result = run_record_worker()
+
+    assert result == 0
+    assert history_store.entries == ["texto recuperado completo"]
+    assert artifact_store.saved[0]["status"] == "success"
+    assert artifact_store.saved[0]["normalized_text"] == "texto recuperado completo"
+    assert state_store.values["last_error"] == ""
+
+
+def test_run_record_worker_saves_cloud_failure_artifact(monkeypatch):
+    state_store = DummyStateStore()
+    history_store = DummyHistoryStore(max_items=5)
+    artifact_store = DummyRecordingArtifactStore()
+    DummyMicrophoneStream.instances = []
+
+    capture = TranscriptionCapture(
+        source="microphone",
+        sample_rate=24000,
+        chunk_ms=40,
+        provider_id="openai_realtime",
+        provider_model="gpt-4o-transcribe",
+    )
+    capture.append_audio_chunk(b"\x01\x00" * 160)
+
+    class CloudFailBackend:
+        provider_id = "openai_realtime"
+        provider_model = "gpt-4o-transcribe"
+        sample_rate = 24000
+        chunk_ms = 40
+        capabilities = SimpleNamespace(local_engine_required=False)
+        last_capture = capture
+
+        def check_ready_blocking(self) -> None:
+            return None
+
+        def transcribe_microphone_blocking(
+            self,
+            stop_event,
+            mic=None,
+            close_mic=True,
+            on_recording_stopped=None,
+        ):
+            del stop_event, mic, close_mic, on_recording_stopped
+            raise OSError("cloud websocket closed")
+
+    monkeypatch.setattr("voxtray.worker.load_config", _build_config)
+    monkeypatch.setattr("voxtray.worker.StateStore", lambda: state_store)
+    monkeypatch.setattr("voxtray.worker.HistoryStore", lambda max_items: history_store)
+    monkeypatch.setattr("voxtray.worker.EngineManager", DummyEngineManager)
+    monkeypatch.setattr("voxtray.worker.create_transcription_backend", lambda config: CloudFailBackend())
+    monkeypatch.setattr("voxtray.worker.MicrophoneStream", DummyMicrophoneStream)
+    monkeypatch.setattr("voxtray.worker.RecordingArtifactStore", lambda: artifact_store)
+    monkeypatch.setattr("voxtray.worker.notify", lambda *args, **kwargs: None)
+    monkeypatch.setattr("voxtray.worker.copy_to_clipboard", lambda text, backend: backend)
+    monkeypatch.setattr("voxtray.worker.normalize_transcript", lambda text: text)
+    monkeypatch.setattr("voxtray.worker.signal.signal", lambda *args, **kwargs: None)
+
+    result = run_record_worker()
+
+    assert result == 1
+    assert history_store.entries == []
+    assert artifact_store.saved[0]["status"] == "error"
+    assert artifact_store.saved[0]["provider_id"] == "openai_realtime"
+    assert artifact_store.saved[0]["error"] == "cloud websocket closed"
+    assert "[artifact: /tmp/voxtray-artifact]" in state_store.values["last_error"]
 
 
 def test_run_record_worker_marks_transcribing_when_microphone_stops(monkeypatch):
@@ -264,7 +694,7 @@ def test_run_record_worker_marks_transcribing_when_microphone_stops(monkeypatch)
     monkeypatch.setattr("voxtray.worker.StateStore", lambda: state_store)
     monkeypatch.setattr("voxtray.worker.HistoryStore", lambda max_items: history_store)
     monkeypatch.setattr("voxtray.worker.EngineManager", DummyEngineManager)
-    monkeypatch.setattr("voxtray.worker.RealtimeTranscriber", StoppingTranscriber)
+    monkeypatch.setattr("voxtray.worker.create_transcription_backend", lambda config: StoppingTranscriber(config))
     monkeypatch.setattr("voxtray.worker.MicrophoneStream", DummyMicrophoneStream)
     monkeypatch.setattr("voxtray.worker.RecordingArtifactStore", lambda: artifact_store)
     monkeypatch.setattr("voxtray.worker.notify", lambda *args, **kwargs: None)
@@ -320,7 +750,7 @@ def test_run_record_worker_skips_loading_notice_when_engine_is_ready(monkeypatch
     monkeypatch.setattr("voxtray.worker.StateStore", lambda: state_store)
     monkeypatch.setattr("voxtray.worker.HistoryStore", lambda max_items: history_store)
     monkeypatch.setattr("voxtray.worker.EngineManager", ReadyEngineManager)
-    monkeypatch.setattr("voxtray.worker.RealtimeTranscriber", SuccessTranscriber)
+    monkeypatch.setattr("voxtray.worker.create_transcription_backend", lambda config: SuccessTranscriber(config))
     monkeypatch.setattr("voxtray.worker.MicrophoneStream", DummyMicrophoneStream)
     monkeypatch.setattr("voxtray.worker.RecordingArtifactStore", lambda: artifact_store)
     monkeypatch.setattr(
@@ -377,7 +807,7 @@ def test_run_record_worker_cancel_during_engine_load_skips_canary(monkeypatch):
     monkeypatch.setattr("voxtray.worker.StateStore", lambda: state_store)
     monkeypatch.setattr("voxtray.worker.HistoryStore", lambda max_items: history_store)
     monkeypatch.setattr("voxtray.worker.EngineManager", CancelingEngineManager)
-    monkeypatch.setattr("voxtray.worker.RealtimeTranscriber", CanaryShouldNotRun)
+    monkeypatch.setattr("voxtray.worker.create_transcription_backend", lambda config: CanaryShouldNotRun(config))
     monkeypatch.setattr("voxtray.worker.MicrophoneStream", DummyMicrophoneStream)
     monkeypatch.setattr("voxtray.worker.RecordingArtifactStore", lambda: artifact_store)
     monkeypatch.setattr(
@@ -435,7 +865,7 @@ def test_run_record_worker_cancel_during_canary_skips_microphone(monkeypatch):
     monkeypatch.setattr("voxtray.worker.StateStore", lambda: state_store)
     monkeypatch.setattr("voxtray.worker.HistoryStore", lambda max_items: history_store)
     monkeypatch.setattr("voxtray.worker.EngineManager", DummyEngineManager)
-    monkeypatch.setattr("voxtray.worker.RealtimeTranscriber", CancelingCanaryTranscriber)
+    monkeypatch.setattr("voxtray.worker.create_transcription_backend", lambda config: CancelingCanaryTranscriber(config))
     monkeypatch.setattr("voxtray.worker.MicrophoneStream", DummyMicrophoneStream)
     monkeypatch.setattr("voxtray.worker.RecordingArtifactStore", lambda: artifact_store)
     monkeypatch.setattr(
@@ -505,7 +935,7 @@ def test_run_record_worker_marks_recording_when_reusing_mic_after_retry(monkeypa
     monkeypatch.setattr("voxtray.worker.StateStore", lambda: state_store)
     monkeypatch.setattr("voxtray.worker.HistoryStore", lambda max_items: history_store)
     monkeypatch.setattr("voxtray.worker.EngineManager", DummyEngineManager)
-    monkeypatch.setattr("voxtray.worker.RealtimeTranscriber", RetryTranscriber)
+    monkeypatch.setattr("voxtray.worker.create_transcription_backend", lambda config: RetryTranscriber(config))
     monkeypatch.setattr("voxtray.worker.MicrophoneStream", DummyMicrophoneStream)
     monkeypatch.setattr("voxtray.worker.RecordingArtifactStore", lambda: artifact_store)
     monkeypatch.setattr("voxtray.worker.notify", lambda *args, **kwargs: None)
@@ -553,7 +983,7 @@ def test_run_record_worker_saves_error_artifact(monkeypatch):
     monkeypatch.setattr("voxtray.worker.StateStore", lambda: state_store)
     monkeypatch.setattr("voxtray.worker.HistoryStore", lambda max_items: history_store)
     monkeypatch.setattr("voxtray.worker.EngineManager", DummyEngineManager)
-    monkeypatch.setattr("voxtray.worker.RealtimeTranscriber", FailingTranscriber)
+    monkeypatch.setattr("voxtray.worker.create_transcription_backend", lambda config: FailingTranscriber(config))
     monkeypatch.setattr("voxtray.worker.MicrophoneStream", DummyMicrophoneStream)
     monkeypatch.setattr("voxtray.worker.RecordingArtifactStore", lambda: artifact_store)
     monkeypatch.setattr("voxtray.worker.notify", lambda *args, **kwargs: None)
@@ -570,6 +1000,61 @@ def test_run_record_worker_saves_error_artifact(monkeypatch):
     assert "[artifact: /tmp/voxtray-artifact]" in state_store.values["last_error"]
     assert state_store.values["last_notice_title"] == "Voxtray Error"
     assert state_store.values["last_notice_body"] == "backend timeout"
+    assert state_store.values["last_notice_level"] == "error"
+    assert DummyMicrophoneStream.instances[0].stopped is True
+
+
+def test_run_record_worker_saves_artifact_for_unexpected_backend_exception(monkeypatch):
+    state_store = DummyStateStore()
+    history_store = DummyHistoryStore(max_items=5)
+    artifact_store = DummyRecordingArtifactStore()
+    DummyMicrophoneStream.instances = []
+
+    capture = TranscriptionCapture(source="microphone", sample_rate=16000, chunk_ms=40)
+    capture.append_audio_chunk(b"\x01\x00" * 160)
+
+    class UnexpectedFailingTranscriber:
+        def __init__(self, config) -> None:
+            del config
+            self.last_capture = capture
+
+        def check_realtime_session_blocking(self) -> None:
+            return None
+
+        def transcribe_microphone_blocking(
+            self,
+            stop_event,
+            mic=None,
+            close_mic=True,
+            on_recording_stopped=None,
+        ):
+            del stop_event, mic, close_mic, on_recording_stopped
+            raise ValueError("websocket closed without close frame")
+
+    monkeypatch.setattr("voxtray.worker.load_config", _build_config)
+    monkeypatch.setattr("voxtray.worker.StateStore", lambda: state_store)
+    monkeypatch.setattr("voxtray.worker.HistoryStore", lambda max_items: history_store)
+    monkeypatch.setattr("voxtray.worker.EngineManager", DummyEngineManager)
+    monkeypatch.setattr(
+        "voxtray.worker.create_transcription_backend",
+        lambda config: UnexpectedFailingTranscriber(config),
+    )
+    monkeypatch.setattr("voxtray.worker.MicrophoneStream", DummyMicrophoneStream)
+    monkeypatch.setattr("voxtray.worker.RecordingArtifactStore", lambda: artifact_store)
+    monkeypatch.setattr("voxtray.worker.notify", lambda *args, **kwargs: None)
+    monkeypatch.setattr("voxtray.worker.copy_to_clipboard", lambda text, backend: backend)
+    monkeypatch.setattr("voxtray.worker.normalize_transcript", lambda text: text)
+    monkeypatch.setattr("voxtray.worker.signal.signal", lambda *args, **kwargs: None)
+
+    result = run_record_worker()
+
+    assert result == 1
+    assert history_store.entries == []
+    assert artifact_store.saved[0]["status"] == "error"
+    assert artifact_store.saved[0]["error"] == "websocket closed without close frame"
+    assert "[artifact: /tmp/voxtray-artifact]" in state_store.values["last_error"]
+    assert state_store.values["last_notice_title"] == "Voxtray Error"
+    assert state_store.values["last_notice_body"] == "websocket closed without close frame"
     assert state_store.values["last_notice_level"] == "error"
     assert DummyMicrophoneStream.instances[0].stopped is True
 
@@ -606,7 +1091,7 @@ def test_run_record_worker_warns_when_microphone_has_no_signal(monkeypatch):
     monkeypatch.setattr("voxtray.worker.StateStore", lambda: state_store)
     monkeypatch.setattr("voxtray.worker.HistoryStore", lambda max_items: history_store)
     monkeypatch.setattr("voxtray.worker.EngineManager", DummyEngineManager)
-    monkeypatch.setattr("voxtray.worker.RealtimeTranscriber", SilentTranscriber)
+    monkeypatch.setattr("voxtray.worker.create_transcription_backend", lambda config: SilentTranscriber(config))
     monkeypatch.setattr("voxtray.worker.MicrophoneStream", DummyMicrophoneStream)
     monkeypatch.setattr("voxtray.worker.RecordingArtifactStore", lambda: artifact_store)
     monkeypatch.setattr(
@@ -634,6 +1119,58 @@ def test_run_record_worker_warns_when_microphone_has_no_signal(monkeypatch):
     ]
     assert state_store.values["last_error"] == NO_MIC_SIGNAL_MESSAGE
     assert notices[-1] == ("Voxtray", NO_MIC_SIGNAL_MESSAGE, "normal")
+
+
+def test_run_record_worker_discards_text_from_no_signal_microphone(monkeypatch):
+    state_store = DummyStateStore()
+    history_store = DummyHistoryStore(max_items=5)
+    artifact_store = DummyRecordingArtifactStore()
+    DummyMicrophoneStream.instances = []
+    copied: list[str] = []
+
+    capture = TranscriptionCapture(source="microphone", sample_rate=16000, chunk_ms=40)
+    capture.append_audio_chunk(b"\x00\x00" * 16000)
+
+    class HallucinatedSilentTranscriber:
+        def __init__(self, config) -> None:
+            self.config = config
+            self.last_capture = capture
+
+        def check_realtime_session_blocking(self) -> None:
+            return None
+
+        def transcribe_microphone_blocking(
+            self,
+            stop_event,
+            mic=None,
+            close_mic=True,
+            on_recording_stopped=None,
+        ):
+            del stop_event, mic, close_mic, on_recording_stopped
+            return "Añádelo en Google Calendar."
+
+    monkeypatch.setattr("voxtray.worker.load_config", _build_config)
+    monkeypatch.setattr("voxtray.worker.StateStore", lambda: state_store)
+    monkeypatch.setattr("voxtray.worker.HistoryStore", lambda max_items: history_store)
+    monkeypatch.setattr("voxtray.worker.EngineManager", DummyEngineManager)
+    monkeypatch.setattr("voxtray.worker.create_transcription_backend", lambda config: HallucinatedSilentTranscriber(config))
+    monkeypatch.setattr("voxtray.worker.MicrophoneStream", DummyMicrophoneStream)
+    monkeypatch.setattr("voxtray.worker.RecordingArtifactStore", lambda: artifact_store)
+    monkeypatch.setattr("voxtray.worker.notify", lambda *args, **kwargs: None)
+    monkeypatch.setattr("voxtray.worker.copy_to_clipboard", lambda text, backend: copied.append(text) or backend)
+    monkeypatch.setattr("voxtray.worker.normalize_transcript", lambda text: text)
+    monkeypatch.setattr("voxtray.worker.signal.signal", lambda *args, **kwargs: None)
+
+    result = run_record_worker()
+
+    assert result == 0
+    assert copied == []
+    assert history_store.entries == []
+    assert artifact_store.saved[0]["status"] == "empty"
+    assert artifact_store.saved[0]["raw_text"] == "Añádelo en Google Calendar."
+    assert artifact_store.saved[0]["normalized_text"] == ""
+    assert artifact_store.saved[0]["error"] == NO_MIC_SIGNAL_MESSAGE
+    assert state_store.values["last_error"] == NO_MIC_SIGNAL_MESSAGE
 
 
 def test_run_record_worker_skips_fallback_when_microphone_has_no_signal(monkeypatch):
@@ -674,7 +1211,7 @@ def test_run_record_worker_skips_fallback_when_microphone_has_no_signal(monkeypa
     monkeypatch.setattr("voxtray.worker.StateStore", lambda: state_store)
     monkeypatch.setattr("voxtray.worker.HistoryStore", lambda max_items: history_store)
     monkeypatch.setattr("voxtray.worker.EngineManager", DummyEngineManager)
-    monkeypatch.setattr("voxtray.worker.RealtimeTranscriber", NoSignalFailingTranscriber)
+    monkeypatch.setattr("voxtray.worker.create_transcription_backend", lambda config: NoSignalFailingTranscriber(config))
     monkeypatch.setattr("voxtray.worker.MicrophoneStream", DummyMicrophoneStream)
     monkeypatch.setattr("voxtray.worker.RecordingArtifactStore", lambda: artifact_store)
     monkeypatch.setattr("voxtray.worker.notify", lambda *args, **kwargs: None)
@@ -756,7 +1293,7 @@ def test_run_record_worker_falls_back_to_saved_audio_after_stop_failure(monkeypa
     monkeypatch.setattr("voxtray.worker.StateStore", lambda: state_store)
     monkeypatch.setattr("voxtray.worker.HistoryStore", lambda max_items: history_store)
     monkeypatch.setattr("voxtray.worker.EngineManager", DummyEngineManager)
-    monkeypatch.setattr("voxtray.worker.RealtimeTranscriber", FallbackTranscriber)
+    monkeypatch.setattr("voxtray.worker.create_transcription_backend", lambda config: FallbackTranscriber(config))
     monkeypatch.setattr("voxtray.worker.MicrophoneStream", DummyMicrophoneStream)
     monkeypatch.setattr("voxtray.worker.RecordingArtifactStore", lambda: artifact_store)
     monkeypatch.setattr("voxtray.worker.notify", lambda *args, **kwargs: None)
@@ -817,7 +1354,7 @@ def test_run_record_worker_resaves_artifact_after_fallback_failure(monkeypatch):
     monkeypatch.setattr("voxtray.worker.StateStore", lambda: state_store)
     monkeypatch.setattr("voxtray.worker.HistoryStore", lambda max_items: history_store)
     monkeypatch.setattr("voxtray.worker.EngineManager", DummyEngineManager)
-    monkeypatch.setattr("voxtray.worker.RealtimeTranscriber", FailingFallbackTranscriber)
+    monkeypatch.setattr("voxtray.worker.create_transcription_backend", lambda config: FailingFallbackTranscriber(config))
     monkeypatch.setattr("voxtray.worker.MicrophoneStream", DummyMicrophoneStream)
     monkeypatch.setattr("voxtray.worker.RecordingArtifactStore", lambda: artifact_store)
     monkeypatch.setattr("voxtray.worker.notify", lambda *args, **kwargs: None)
@@ -844,6 +1381,63 @@ def test_run_record_worker_resaves_artifact_after_fallback_failure(monkeypatch):
         },
     ]
     assert "[artifact: /tmp/voxtray-artifact]" in state_store.values["last_error"]
+
+
+def test_run_record_worker_saves_partial_text_when_done_never_arrives(monkeypatch):
+    state_store = DummyStateStore()
+    history_store = DummyHistoryStore(max_items=5)
+    artifact_store = DummyRecordingArtifactStore()
+    DummyMicrophoneStream.instances = []
+
+    live_capture = TranscriptionCapture(source="microphone", sample_rate=16000, chunk_ms=40)
+    live_capture.append_audio_chunk(b"\x01\x00" * 160)
+
+    class PartialTimeoutTranscriber:
+        def __init__(self, config) -> None:
+            del config
+            self.last_capture = live_capture
+
+        def check_realtime_session_blocking(self) -> None:
+            return None
+
+        def transcribe_microphone_blocking(
+            self,
+            stop_event,
+            mic=None,
+            close_mic=True,
+            on_recording_stopped=None,
+        ):
+            del mic, close_mic, on_recording_stopped
+            stop_event.set()
+            raise RealtimeError(
+                "timed out waiting for transcription.done after 16.0s "
+                "after receiving partial transcript: texto parcial"
+            )
+
+        def transcribe_file_blocking(self, audio_path: Path):
+            assert audio_path == Path("/tmp/voxtray-artifact/audio.wav")
+            return ""
+
+    monkeypatch.setattr("voxtray.worker.load_config", _build_config)
+    monkeypatch.setattr("voxtray.worker.StateStore", lambda: state_store)
+    monkeypatch.setattr("voxtray.worker.HistoryStore", lambda max_items: history_store)
+    monkeypatch.setattr("voxtray.worker.EngineManager", DummyEngineManager)
+    monkeypatch.setattr("voxtray.worker.create_transcription_backend", lambda config: PartialTimeoutTranscriber(config))
+    monkeypatch.setattr("voxtray.worker.MicrophoneStream", DummyMicrophoneStream)
+    monkeypatch.setattr("voxtray.worker.RecordingArtifactStore", lambda: artifact_store)
+    monkeypatch.setattr("voxtray.worker.notify", lambda *args, **kwargs: None)
+    monkeypatch.setattr("voxtray.worker.copy_to_clipboard", lambda text, backend: backend)
+    monkeypatch.setattr("voxtray.worker.normalize_transcript", lambda text: text)
+    monkeypatch.setattr("voxtray.worker.signal.signal", lambda *args, **kwargs: None)
+
+    result = run_record_worker()
+
+    assert result == 0
+    assert history_store.entries == ["texto parcial"]
+    assert artifact_store.saved[-1]["status"] == "partial"
+    assert artifact_store.saved[-1]["normalized_text"] == "texto parcial"
+    assert state_store.values["last_notice_body"] == "Partial transcription saved and copied"
+    assert state_store.values["last_notice_level"] == "warning"
 
 
 def test_record_worker_signal_handler_only_sets_memory_flag(monkeypatch):
@@ -892,7 +1486,7 @@ def test_record_worker_signal_handler_only_sets_memory_flag(monkeypatch):
     monkeypatch.setattr("voxtray.worker.StateStore", lambda: state_store)
     monkeypatch.setattr("voxtray.worker.HistoryStore", lambda max_items: history_store)
     monkeypatch.setattr("voxtray.worker.EngineManager", DummyEngineManager)
-    monkeypatch.setattr("voxtray.worker.RealtimeTranscriber", StoppedTranscriber)
+    monkeypatch.setattr("voxtray.worker.create_transcription_backend", lambda config: StoppedTranscriber(config))
     monkeypatch.setattr("voxtray.worker.MicrophoneStream", DummyMicrophoneStream)
     monkeypatch.setattr("voxtray.worker.RecordingArtifactStore", lambda: artifact_store)
     monkeypatch.setattr("voxtray.worker.notify", lambda *args, **kwargs: None)

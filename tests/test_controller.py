@@ -2,7 +2,7 @@ from pathlib import Path
 import signal
 
 from voxtray.controller import Controller
-from voxtray.state import StateStore
+from voxtray.state import StateStore, UNEXPECTED_RECORDING_EXIT_MESSAGE
 
 
 def _build_controller(tmp_path: Path, monkeypatch) -> Controller:
@@ -21,6 +21,13 @@ def test_status_reports_processing_after_stop_requested(tmp_path, monkeypatch):
         recording_pid=1234,
         recording_stop_requested=True,
         activity_state="transcribing",
+        last_artifact_path="/tmp/artifact",
+        last_history_id="history-1",
+        last_history_index=1,
+        last_clipboard_backend="xclip",
+        last_clipboard_verified=True,
+        last_clipboard_verification_supported=True,
+        last_clipboard_error="",
     )
 
     status = ctl.status()
@@ -30,6 +37,13 @@ def test_status_reports_processing_after_stop_requested(tmp_path, monkeypatch):
     assert status["activity_state"] == "transcribing"
     assert status["recording_pid"] == 1234
     assert status["recording_stop_requested"] is True
+    assert status["last_artifact_path"] == "/tmp/artifact"
+    assert status["last_history_id"] == "history-1"
+    assert status["last_history_index"] == 1
+    assert status["last_clipboard_backend"] == "xclip"
+    assert status["last_clipboard_verified"] is True
+    assert status["last_clipboard_verification_supported"] is True
+    assert status["last_clipboard_error"] == ""
 
 
 def test_stop_recording_marks_processing_immediately(tmp_path, monkeypatch):
@@ -68,6 +82,28 @@ def test_toggle_ignores_processing_recording(tmp_path, monkeypatch):
     message = ctl.toggle_recording()
 
     assert message == "recording is already stopping and transcribing (pid=1234)"
+
+
+def test_toggle_reports_stale_recording_before_restart(tmp_path, monkeypatch):
+    ctl = Controller(config_path=tmp_path / "config.toml")
+    ctl.state_store = StateStore(path=tmp_path / "state.json")
+    ctl.engine.state_store = ctl.state_store
+    ctl.state_store.set_values(
+        recording_pid=1234,
+        recording_stop_requested=False,
+        activity_state="recording",
+    )
+    monkeypatch.setattr("voxtray.state.pid_is_alive", lambda pid: False)
+    monkeypatch.setattr(
+        ctl,
+        "_spawn_record_worker",
+        lambda: (_ for _ in ()).throw(AssertionError("should not restart immediately")),
+    )
+
+    message = ctl.toggle_recording()
+
+    assert message == UNEXPECTED_RECORDING_EXIT_MESSAGE
+    assert ctl.state_store.read()["activity_state"] == "idle"
 
 
 def test_shutdown_waits_for_already_stopping_recording_before_unload(

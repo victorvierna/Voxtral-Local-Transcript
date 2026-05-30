@@ -19,7 +19,7 @@ cat > "$DESKTOP_FILE" <<DESKTOP
 [Desktop Entry]
 Type=Application
 Name=Voxtray
-Comment=Local Voxtral realtime transcription tray app
+Comment=Voxtray realtime transcription tray app
 Exec=$VOXTRAY_CMD tray
 Icon=audio-input-microphone
 Terminal=false

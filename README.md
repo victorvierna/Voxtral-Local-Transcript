@@ -1,6 +1,6 @@
 # Voxtray
 
-Voxtray is a local real-time transcription utility (CLI + system tray) built around `mistralai/Voxtral-Mini-4B-Realtime-2602`.
+Voxtray is a real-time transcription utility (CLI + system tray) with interchangeable local and cloud providers.
 
 It is designed for daily Ubuntu/WSL2 usage with quick toggle activation, automatic clipboard copy, and recent-history tracking.
 
@@ -14,6 +14,7 @@ Spanish documentation: `LEEME.md`.
 - Persistent history (last 5 transcripts by default).
 - Tray mode (`tray`) with quick actions and engine status.
 - Audio file transcription (`transcribe-file`).
+- Provider profiles for local Voxtral/vLLM, Mistral Realtime, and OpenAI Realtime transcription.
 - Windows + WSL2 distribution flow (included scripts).
 
 ## Requirements
@@ -54,6 +55,15 @@ Hugging Face access (optional):
 export HF_TOKEN=...
 ```
 
+Cloud providers do not need vLLM. Install the optional Mistral SDK only if you
+use the Mistral Realtime profile:
+
+```bash
+pip install -e '.[cloud]'
+export MISTRAL_API_KEY=...
+export OPENAI_API_KEY=...
+```
+
 ## Quick Start
 
 Initialize config:
@@ -89,6 +99,9 @@ voxtray model unload
 voxtray model status
 ```
 
+For cloud profiles, `warm` and `model` commands return an explicit no-op message
+because no local engine is used.
+
 History:
 
 ```bash
@@ -102,6 +115,14 @@ Transcribe audio file:
 voxtray transcribe-file /path/audio.m4a --copy
 ```
 
+Audit saved recording quality:
+
+```bash
+voxtray recordings audit --limit 200
+# CI/local gate when you expect a clean corpus
+voxtray recordings audit --limit 200 --fail-on-issues
+```
+
 ## Configuration and Profiles
 
 Main file:
@@ -113,18 +134,55 @@ Included memory profiles:
 - `profiles/voxtray-balanced.toml`
 - `profiles/voxtray-vram-saver.toml`
 - `profiles/voxtray-latency.toml`
+- `profiles/voxtray-online-mistral.toml`
+- `profiles/voxtray-online-openai.toml`
 
 Apply profile:
 
 ```bash
-scripts/apply_profile.sh balanced
+scripts/apply_profile.sh local-balanced
 ```
 
 Available values:
 
-- `balanced`
-- `vram-saver`
-- `latency`
+- `local-balanced` (`balanced` legacy alias)
+- `local-vram-saver` (`vram-saver` legacy alias)
+- `local-latency` (`latency` legacy alias)
+- `online-mistral`
+- `online-openai`
+
+Provider config is stored without secrets:
+
+```toml
+[transcription]
+provider = "openai_realtime"
+
+[openai_realtime]
+api_key_env = "OPENAI_API_KEY"
+model = "gpt-realtime-whisper"
+fallback_model = "whisper-1"
+sample_rate = 24000
+turn_detection = "manual"
+delay = "high"
+language = "es"
+prompt = "Transcribe literally Spanish voice commands. Preserve project names mentioned by the speaker."
+```
+
+The CLI/tray resolves the configured variable from the process environment, and
+also from the repo-local `.env` file when present. This keeps GNOME autostart
+working without storing the actual API key in `config.toml`.
+
+The OpenAI profile uses `gpt-realtime-whisper` for native streaming
+transcription with `delay = "high"` for better accuracy, and `whisper-1` for the
+batch fallback so recovery stays in the Whisper model family instead of jumping
+to a GPT-4o transcription model. You can still set `openai_realtime.model` and
+`fallback_model` to another supported transcription model without storing any
+key in the config file. For recordings where Realtime returns empty or clearly
+truncated text, Voxtray automatically retries the captured WAV with
+`fallback_model` before saving history or copying to the clipboard.
+
+`voxtray status` reports `provider`, `provider_ready`, `local_engine_ready`,
+`model_id`, `warm_supported`, and `api_key_env_present`.
 
 ## GNOME Integration
 
@@ -205,6 +263,10 @@ Project structure:
 - State, logs, and history are stored in your home directory:
   - `~/.local/state/voxtray/`
   - `~/.local/share/voxtray/`
+- Saved recording artifacts include `audio.wav` and `result.json` under
+  `~/.local/share/voxtray/recordings/`. `voxtray recordings audit` checks the
+  local metadata for suspicious truncation, failed fallback, missing signal, and
+  incomplete segment results without uploading audio.
 
 ## License
 

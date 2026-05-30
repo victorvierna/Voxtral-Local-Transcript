@@ -46,6 +46,42 @@ class PostprocessConfig:
 
 
 @dataclass(slots=True)
+class AssistantConfig:
+    enabled: bool = False
+    endpoint: str = "http://127.0.0.1:8777/api/route"
+    token_env: str = "HARVIS_API_TOKEN"
+    token_file: str = ""
+    timeout_seconds: float = 1.5
+    fail_open_to_clipboard: bool = True
+    speak_confirmations: bool = True
+
+
+@dataclass(slots=True)
+class TranscriptionConfig:
+    provider: str = "local_voxtral"
+
+
+@dataclass(slots=True)
+class MistralRealtimeConfig:
+    api_key_env: str = "MISTRAL_API_KEY"
+    model: str = "voxtral-mini-transcribe-realtime-2602"
+    sample_rate: int = 16000
+    target_delay_ms: int = 480
+
+
+@dataclass(slots=True)
+class OpenAIRealtimeConfig:
+    api_key_env: str = "OPENAI_API_KEY"
+    model: str = "gpt-realtime-whisper"
+    fallback_model: str = "whisper-1"
+    sample_rate: int = 24000
+    turn_detection: str = "manual"
+    delay: str = "high"
+    language: str = ""
+    prompt: str = ""
+
+
+@dataclass(slots=True)
 class RealtimeConfig:
     final_timeout_seconds: float = 12.0
     segment_max_seconds: int = 120
@@ -72,6 +108,12 @@ class VoxtrayConfig:
     history: HistoryConfig = field(default_factory=HistoryConfig)
     clipboard: ClipboardConfig = field(default_factory=ClipboardConfig)
     postprocess: PostprocessConfig = field(default_factory=PostprocessConfig)
+    assistant: AssistantConfig = field(default_factory=AssistantConfig)
+    transcription: TranscriptionConfig = field(default_factory=TranscriptionConfig)
+    mistral_realtime: MistralRealtimeConfig = field(
+        default_factory=MistralRealtimeConfig
+    )
+    openai_realtime: OpenAIRealtimeConfig = field(default_factory=OpenAIRealtimeConfig)
     realtime: RealtimeConfig = field(default_factory=RealtimeConfig)
     engine: EngineConfig = field(default_factory=EngineConfig)
 
@@ -111,6 +153,9 @@ def _default_dict() -> dict[str, Any]:
     )
     return {
         "model_id": "mistralai/Voxtral-Mini-4B-Realtime-2602",
+        "transcription": {
+            "provider": "local_voxtral",
+        },
         "server": {
             "host": "127.0.0.1",
             "port": 8000,
@@ -125,6 +170,31 @@ def _default_dict() -> dict[str, Any]:
         "history": {"max_items": 5},
         "clipboard": {"backend": "auto"},
         "postprocess": {"clean_text": True},
+        "assistant": {
+            "enabled": False,
+            "endpoint": "http://127.0.0.1:8777/api/route",
+            "token_env": "HARVIS_API_TOKEN",
+            "token_file": "",
+            "timeout_seconds": 1.5,
+            "fail_open_to_clipboard": True,
+            "speak_confirmations": True,
+        },
+        "mistral_realtime": {
+            "api_key_env": "MISTRAL_API_KEY",
+            "model": "voxtral-mini-transcribe-realtime-2602",
+            "sample_rate": 16000,
+            "target_delay_ms": 480,
+        },
+        "openai_realtime": {
+            "api_key_env": "OPENAI_API_KEY",
+            "model": "gpt-realtime-whisper",
+            "fallback_model": "whisper-1",
+            "sample_rate": 24000,
+            "turn_detection": "manual",
+            "delay": "high",
+            "language": "",
+            "prompt": "",
+        },
         "realtime": {
             "final_timeout_seconds": 12.0,
             "segment_max_seconds": 120,
@@ -161,6 +231,9 @@ def _normalize_engine_extra_args(model_id: str, engine_data: dict[str, Any]) -> 
 def config_to_dict(config: VoxtrayConfig) -> dict[str, Any]:
     return {
         "model_id": config.model_id,
+        "transcription": {
+            "provider": config.transcription.provider,
+        },
         "server": {
             "host": config.server.host,
             "port": config.server.port,
@@ -175,6 +248,31 @@ def config_to_dict(config: VoxtrayConfig) -> dict[str, Any]:
         "history": {"max_items": config.history.max_items},
         "clipboard": {"backend": config.clipboard.backend},
         "postprocess": {"clean_text": config.postprocess.clean_text},
+        "assistant": {
+            "enabled": config.assistant.enabled,
+            "endpoint": config.assistant.endpoint,
+            "token_env": config.assistant.token_env,
+            "token_file": config.assistant.token_file,
+            "timeout_seconds": config.assistant.timeout_seconds,
+            "fail_open_to_clipboard": config.assistant.fail_open_to_clipboard,
+            "speak_confirmations": config.assistant.speak_confirmations,
+        },
+        "mistral_realtime": {
+            "api_key_env": config.mistral_realtime.api_key_env,
+            "model": config.mistral_realtime.model,
+            "sample_rate": config.mistral_realtime.sample_rate,
+            "target_delay_ms": config.mistral_realtime.target_delay_ms,
+        },
+        "openai_realtime": {
+            "api_key_env": config.openai_realtime.api_key_env,
+            "model": config.openai_realtime.model,
+            "fallback_model": config.openai_realtime.fallback_model,
+            "sample_rate": config.openai_realtime.sample_rate,
+            "turn_detection": config.openai_realtime.turn_detection,
+            "delay": config.openai_realtime.delay,
+            "language": config.openai_realtime.language,
+            "prompt": config.openai_realtime.prompt,
+        },
         "realtime": {
             "final_timeout_seconds": config.realtime.final_timeout_seconds,
             "segment_max_seconds": config.realtime.segment_max_seconds,
@@ -219,6 +317,10 @@ def load_config(path: Path | None = None) -> VoxtrayConfig:
     history = HistoryConfig(**data["history"])
     clipboard = ClipboardConfig(**data["clipboard"])
     postprocess = PostprocessConfig(**data["postprocess"])
+    assistant = AssistantConfig(**data["assistant"])
+    transcription = TranscriptionConfig(**data["transcription"])
+    mistral_realtime = MistralRealtimeConfig(**data["mistral_realtime"])
+    openai_realtime = OpenAIRealtimeConfig(**data["openai_realtime"])
     realtime = RealtimeConfig(**data["realtime"])
     model_id = str(data["model_id"])
     engine_data = _normalize_engine_extra_args(model_id, dict(data["engine"]))
@@ -233,6 +335,10 @@ def load_config(path: Path | None = None) -> VoxtrayConfig:
         history=history,
         clipboard=clipboard,
         postprocess=postprocess,
+        assistant=assistant,
+        transcription=transcription,
+        mistral_realtime=mistral_realtime,
+        openai_realtime=openai_realtime,
         realtime=realtime,
         engine=engine,
     )

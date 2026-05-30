@@ -23,6 +23,7 @@ dependencies = [
 [project.optional-dependencies]
 ui = ["PySide6>=6.7"]
 audiofile = ["librosa>=0.10"]
+cloud = ["mistralai[realtime]>=1.0"]
 dev = ["pytest>=8.2"]
 
 [project.scripts]

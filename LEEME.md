@@ -1,6 +1,6 @@
 # Voxtray
 
-Voxtray es una utilidad local de transcripción en tiempo real (CLI + bandeja del sistema) construida alrededor de `mistralai/Voxtral-Mini-4B-Realtime-2602`.
+Voxtray es una utilidad de transcripción en tiempo real (CLI + bandeja del sistema) con proveedores intercambiables local/cloud.
 
 Está pensada para uso diario en Ubuntu/WSL2 con activación rápida (`toggle`), copiado automático al portapapeles e historial reciente.
 
@@ -12,6 +12,7 @@ Está pensada para uso diario en Ubuntu/WSL2 con activación rápida (`toggle`),
 - Historial persistente (últimas 5 transcripciones por defecto).
 - Modo bandeja (`tray`) con acciones rápidas y estado del motor.
 - Transcripción de archivos de audio (`transcribe-file`).
+- Perfiles para Voxtral/vLLM local, Mistral Realtime y OpenAI Realtime.
 - Flujo de distribución para Windows + WSL2 (scripts incluidos).
 
 ## Requisitos
@@ -52,6 +53,15 @@ Acceso a Hugging Face (opcional):
 export HF_TOKEN=...
 ```
 
+Los proveedores cloud no necesitan vLLM. Instala el SDK de Mistral solo si vas
+a usar el perfil de Mistral Realtime:
+
+```bash
+pip install -e '.[cloud]'
+export MISTRAL_API_KEY=...
+export OPENAI_API_KEY=...
+```
+
 ## Inicio rápido
 
 Inicializar configuración:
@@ -87,6 +97,9 @@ voxtray model unload
 voxtray model status
 ```
 
+Con perfiles cloud, `warm` y `model` devuelven un mensaje explícito de no-op:
+no hay motor local que precargar o descargar.
+
 Historial:
 
 ```bash
@@ -100,6 +113,14 @@ Transcribir archivo de audio:
 voxtray transcribe-file /ruta/audio.m4a --copy
 ```
 
+Auditar calidad de grabaciones guardadas:
+
+```bash
+voxtray recordings audit --limit 200
+# gate local/CI cuando esperas un corpus limpio
+voxtray recordings audit --limit 200 --fail-on-issues
+```
+
 ## Configuración y perfiles
 
 Archivo principal:
@@ -111,18 +132,55 @@ Perfiles de memoria incluidos:
 - `profiles/voxtray-balanced.toml`
 - `profiles/voxtray-vram-saver.toml`
 - `profiles/voxtray-latency.toml`
+- `profiles/voxtray-online-mistral.toml`
+- `profiles/voxtray-online-openai.toml`
 
 Aplicar perfil:
 
 ```bash
-scripts/apply_profile.sh balanced
+scripts/apply_profile.sh local-balanced
 ```
 
 Valores disponibles:
 
-- `balanced`
-- `vram-saver`
-- `latency`
+- `local-balanced` (`balanced` sigue como alias)
+- `local-vram-saver` (`vram-saver` sigue como alias)
+- `local-latency` (`latency` sigue como alias)
+- `online-mistral`
+- `online-openai`
+
+La configuración guarda nombres de variables de entorno, no claves reales:
+
+```toml
+[transcription]
+provider = "openai_realtime"
+
+[openai_realtime]
+api_key_env = "OPENAI_API_KEY"
+model = "gpt-realtime-whisper"
+fallback_model = "whisper-1"
+sample_rate = 24000
+turn_detection = "manual"
+delay = "high"
+language = "es"
+prompt = "Transcribe literalmente comandos de voz en español. Conserva los nombres de proyecto mencionados por la persona."
+```
+
+El CLI/tray resuelve la variable configurada desde el entorno del proceso y,
+si existe, desde el `.env` local del repo. Así el autostart de GNOME funciona
+sin guardar la clave real en `config.toml`.
+
+El perfil OpenAI usa `gpt-realtime-whisper` para streaming nativo con
+`delay = "high"` para priorizar calidad, y `whisper-1` para el fallback batch,
+de forma que la recuperación se mantiene en la familia Whisper en vez de saltar
+a un modelo de transcripción GPT-4o. Puedes cambiar `openai_realtime.model` y
+`fallback_model` a otro modelo soportado sin tocar secretos en `config.toml`.
+Para grabaciones donde Realtime devuelva texto vacío o claramente truncado,
+Voxtray reintenta automáticamente el WAV capturado con `fallback_model` antes de
+guardar historial o copiar al portapapeles.
+
+`voxtray status` muestra `provider`, `provider_ready`, `local_engine_ready`,
+`model_id`, `warm_supported` y `api_key_env_present`.
 
 ## Integración GNOME
 
@@ -203,6 +261,10 @@ Estructura del proyecto:
 - Estado, logs e historial se guardan en tu home:
   - `~/.local/state/voxtray/`
   - `~/.local/share/voxtray/`
+- Los artefactos de grabación guardan `audio.wav` y `result.json` en
+  `~/.local/share/voxtray/recordings/`. `voxtray recordings audit` revisa la
+  metadata local para detectar truncados sospechosos, fallos de fallback, falta
+  de señal y segmentos incompletos sin subir audio.
 
 ## Licencia
 

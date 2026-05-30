@@ -7,7 +7,7 @@ import os
 import subprocess
 import threading
 
-from .clipboard import ClipboardError, copy_to_clipboard
+from .clipboard import ClipboardError, copy_to_clipboard, verify_clipboard_text
 from .controller import Controller
 from .history import preview_text
 
@@ -62,9 +62,12 @@ def run_tray(controller: Controller | None = None) -> int:
     menu.addAction(action_model)
 
     menu.addSeparator()
-    history_menu = menu.addMenu("Recent (5)")
+    action_history_header = QAction("Recent (0)")
+    action_history_header.setEnabled(False)
+    menu.addAction(action_history_header)
+    history_actions: list[QAction] = []
 
-    menu.addSeparator()
+    history_separator = menu.addSeparator()
     action_status = QAction("Show Status")
     menu.addAction(action_status)
 
@@ -216,7 +219,17 @@ def run_tray(controller: Controller | None = None) -> int:
         text = str(entry.get("text", ""))
         preview = preview_text(text)
         try:
-            copy_to_clipboard(text, backend=ctl.config.clipboard.backend)
+            backend = copy_to_clipboard(text, backend=ctl.config.clipboard.backend)
+            verified = verify_clipboard_text(text, backend)
+            if verified is False:
+                _notify(
+                    "Voxtray",
+                    f"Saved #{index}, but clipboard was not verified: {preview}",
+                    QSystemTrayIcon.MessageIcon.Warning,
+                    3200,
+                    interactive=False,
+                )
+                return
             _notify(
                 "Voxtray",
                 f"Copied #{index}: {preview}",
@@ -242,14 +255,24 @@ def run_tray(controller: Controller | None = None) -> int:
                 interactive=False,
             )
 
+    def _clear_history_actions() -> None:
+        while history_actions:
+            action = history_actions.pop()
+            menu.removeAction(action)
+            action.deleteLater()
+
+    def _add_history_action(action: QAction) -> None:
+        history_actions.append(action)
+        menu.insertAction(history_separator, action)
+
     def _rebuild_history_menu() -> None:
-        entries = ctl.list_history()
-        history_menu.clear()
-        history_menu.setTitle(f"Recent ({len(entries)})")
+        entries = ctl.list_history()[:5]
+        _clear_history_actions()
+        action_history_header.setText(f"Recent ({len(entries)})")
         if not entries:
             empty = QAction("No transcripts yet")
             empty.setEnabled(False)
-            history_menu.addAction(empty)
+            _add_history_action(empty)
             return
 
         for idx, entry in enumerate(entries, start=1):
@@ -262,7 +285,7 @@ def run_tray(controller: Controller | None = None) -> int:
             action.triggered.connect(
                 lambda checked=False, e=entry, i=idx: _copy_history_entry(e, i)
             )
-            history_menu.addAction(action)
+            _add_history_action(action)
 
     def _refresh() -> None:
         nonlocal menu_is_open
@@ -350,18 +373,15 @@ def run_tray(controller: Controller | None = None) -> int:
     action_status.triggered.connect(_show_status)
     action_open_config.triggered.connect(_open_config_dir)
     action_quit.triggered.connect(_quit)
-    menu.aboutToShow.connect(lambda: _set_menu_open(True))
-    menu.aboutToHide.connect(lambda: _set_menu_open(False))
-
-    def _on_history_menu_show() -> None:
+    def _on_menu_show() -> None:
         _set_menu_open(True)
         try:
             _rebuild_history_menu()
         except Exception:
             logger.exception("failed rebuilding history menu")
 
-    history_menu.aboutToShow.connect(_on_history_menu_show)
-    history_menu.aboutToHide.connect(lambda: _set_menu_open(False))
+    menu.aboutToShow.connect(_on_menu_show)
+    menu.aboutToHide.connect(lambda: _set_menu_open(False))
 
     tray.activated.connect(
         lambda reason: _toggle_record()
@@ -374,6 +394,7 @@ def run_tray(controller: Controller | None = None) -> int:
     refresh_timer.timeout.connect(_refresh)
     refresh_timer.start()
 
+    _rebuild_history_menu()
     tray.show()
     _refresh()
     _run_async(_preload_model_startup)

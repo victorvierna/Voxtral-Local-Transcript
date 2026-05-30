@@ -7,8 +7,14 @@ import json
 import os
 from pathlib import Path
 from typing import Any, Callable
+from uuid import uuid4
 
 from .paths import STATE_FILE, STATE_LOCK_FILE, ensure_app_dirs
+
+
+UNEXPECTED_RECORDING_EXIT_MESSAGE = (
+    "Recording process exited unexpectedly before finishing. No transcript was copied."
+)
 
 
 def now_utc_iso() -> str:
@@ -61,6 +67,17 @@ class StateStore:
             "last_notice_title": "",
             "last_notice_body": "",
             "last_notice_level": "info",
+            "last_artifact_path": "",
+            "last_history_id": "",
+            "last_history_index": 0,
+            "last_clipboard_backend": "",
+            "last_clipboard_verified": False,
+            "last_clipboard_verification_supported": False,
+            "last_clipboard_error": "",
+            "last_assistant_command_id": "",
+            "last_assistant_route": "",
+            "last_assistant_agent_id": "",
+            "last_assistant_error": "",
             "updated_at": now_utc_iso(),
         }
 
@@ -106,7 +123,12 @@ class StateStore:
             if state.get("recording_pid") and not pid_is_alive(state["recording_pid"]):
                 state["recording_pid"] = None
                 state["recording_stop_requested"] = False
-                state["activity_state"] = "idle"
+                state["activity_state"] = "error"
+                state["last_error"] = UNEXPECTED_RECORDING_EXIT_MESSAGE
+                state["last_notice_id"] = uuid4().hex
+                state["last_notice_title"] = "Voxtray Error"
+                state["last_notice_body"] = UNEXPECTED_RECORDING_EXIT_MESSAGE
+                state["last_notice_level"] = "error"
                 changed = True
             if state.get("engine_pid") and not pid_is_alive(state["engine_pid"]):
                 state["engine_pid"] = None
