@@ -1,8 +1,12 @@
 # Voxtray
 
-Voxtray is a real-time transcription utility (CLI + system tray) with interchangeable local and cloud providers.
+Voxtray is a real-time transcription utility (CLI + system tray) with
+interchangeable local and cloud providers.
 
-It is designed for daily Ubuntu/WSL2 usage with quick toggle activation, automatic clipboard copy, and recent-history tracking.
+It is designed for daily Ubuntu/WSL2 usage with quick toggle activation,
+automatic clipboard copy, and recent-history tracking. You can run it fully
+locally with Voxtral/vLLM, or switch to cloud transcription profiles for Mistral
+Realtime or OpenAI Realtime when you prefer managed models.
 
 Spanish documentation: `LEEME.md`.
 
@@ -14,7 +18,8 @@ Spanish documentation: `LEEME.md`.
 - Persistent history (last 5 transcripts by default).
 - Tray mode (`tray`) with quick actions and engine status.
 - Audio file transcription (`transcribe-file`).
-- Provider profiles for local Voxtral/vLLM, Mistral Realtime, and OpenAI Realtime transcription.
+- Provider profiles for local Voxtral/vLLM or cloud models through Mistral
+  Realtime and OpenAI Realtime.
 - Windows + WSL2 distribution flow (included scripts).
 
 ## Requirements
@@ -255,18 +260,6 @@ Project structure:
 - `tests/`: unit tests.
 - `scripts/`: Ubuntu/WSL2 integration and packaging utilities.
 - `profiles/`: performance/memory configuration templates.
-
-## Security and Local Data
-
-- Do not commit credentials or tokens.
-- Use local environment variables (example in `.env.example`).
-- State, logs, and history are stored in your home directory:
-  - `~/.local/state/voxtray/`
-  - `~/.local/share/voxtray/`
-- Saved recording artifacts include `audio.wav` and `result.json` under
-  `~/.local/share/voxtray/recordings/`. `voxtray recordings audit` checks the
-  local metadata for suspicious truncation, failed fallback, missing signal, and
-  incomplete segment results without uploading audio.
 
 ## License
 
